@@ -1,0 +1,266 @@
+"""Call lifecycle manager for wake-up coach."""
+
+import asyncio
+import logging
+from typing import Optional
+from datetime import datetime, time as dt_time
+
+from ari_client import ARIClient
+from openai_client import OpenAIRealtimeClient
+# from audio_bridge import AudioBridge
+from audio_bridge_rtp import AudioBridgeRTP
+from config import Config
+
+
+class CallManager:
+    """Manages the lifecycle of wake-up calls."""
+
+    def __init__(self, config: Config, logger: logging.Logger):
+        """
+        Initialize call manager.
+
+        Args:
+            config: Application configuration
+            logger: Logger instance
+        """
+        self.config = config
+        self.logger = logger
+        self.ari: Optional[ARIClient] = None
+        self.openai: Optional[OpenAIRealtimeClient] = None
+        self.bridge: Optional[AudioBridgeRTP] = None
+        self.current_channel_id: Optional[str] = None
+        self.call_active = False
+
+    async def start(self):
+        """Start the call manager and initiate a wake-up call."""
+        self.logger.info("Starting call manager")
+
+        # Initialize clients
+        self.ari = ARIClient(self.config.asterisk, self.logger)
+        self.openai = OpenAIRealtimeClient(
+            self.config.openai,
+            self.logger,
+            wake_keyword=self.config.call.wake_keyword
+        )
+
+        # Set up wake detection callback
+        self.openai.on_wake_detected = self._handle_wake_detected
+
+        async with self.ari:
+            # Connect to ARI WebSocket
+            await self.ari.connect_websocket()
+
+            # Register event handlers
+            self.ari.on_event("StasisStart", self._handle_stasis_start)
+            self.ari.on_event("ChannelStateChange", self._handle_channel_state_change)
+            self.ari.on_event("ChannelHangupRequest", self._handle_hangup_request)
+            self.ari.on_event("ChannelDestroyed", self._handle_channel_destroyed)
+
+            # Connect to OpenAI
+            await self.openai.connect()
+
+            # Wait for scheduled wake-up time (if configured)
+            await self._wait_for_wake_time()
+
+            # Originate the call
+            await self._originate_call()
+
+            # Listen for events
+            await self.ari.listen_for_events()
+
+    async def _wait_for_wake_time(self):
+        """Wait until the scheduled wake-up time before calling."""
+        if not self.config.call.wake_up_time:
+            self.logger.info("No wake-up time configured, calling immediately")
+            return
+
+        try:
+            # Parse wake-up time (HH:MM format)
+            wake_hour, wake_minute = map(int, self.config.call.wake_up_time.split(':'))
+            wake_time = dt_time(wake_hour, wake_minute)
+        except (ValueError, AttributeError) as e:
+            self.logger.warning(f"Invalid wake-up time format '{self.config.call.wake_up_time}', calling immediately: {e}")
+            return
+
+        now = datetime.now()
+        wake_datetime = datetime.combine(now.date(), wake_time)
+
+        # If wake time has already passed today, schedule for tomorrow
+        if wake_datetime <= now:
+            from datetime import timedelta
+            wake_datetime += timedelta(days=1)
+
+        wait_seconds = (wake_datetime - now).total_seconds()
+        wait_hours = wait_seconds / 3600
+
+        self.logger.info(f"Scheduled wake-up call for {wake_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+        self.logger.info(f"Waiting {wait_hours:.2f} hours ({wait_seconds:.0f} seconds) until wake-up time...")
+
+        # Wait until wake-up time
+        await asyncio.sleep(wait_seconds)
+
+        self.logger.info(f"Wake-up time reached! Originating call...")
+
+    async def _originate_call(self):
+        """Originate a wake-up call with retry logic."""
+        # Use Local channel to route through FreePBX dialplan/outbound routes
+        # This ensures proper call routing via configured outbound routes
+        number = self.config.call.target_phone_number
+
+        # Remove leading + for dialplan routing (FreePBX typically doesn't use + prefix)
+        dial_number = number.lstrip('+')
+        endpoint = f"Local/{dial_number}@from-internal"
+
+        self.logger.info(f"Originating call via Local channel: {endpoint} (original: {number})")
+
+        max_retries = 3
+        retry_delay = 5  # seconds
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                channel = await self.ari.originate_call(
+                    endpoint=endpoint,
+                    caller_id="Wake Up Coach"
+                )
+                self.current_channel_id = channel.get("id")
+                self.call_active = True
+                self.logger.info(f"Call originated successfully: {self.current_channel_id}")
+                return
+
+            except Exception as e:
+                self.logger.error(f"Failed to originate call (attempt {attempt}/{max_retries}): {e}")
+                
+                if attempt < max_retries:
+                    self.logger.info(f"Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                else:
+                    self.logger.error("Failed to originate call after all retries. Service will continue running.")
+                    # Don't raise - allow service to keep running for next scheduled call
+                    # The service will retry on the next scheduled wake-up time
+
+    async def _handle_stasis_start(self, event: dict):
+        """
+        Handle StasisStart event when call enters the application.
+
+        Args:
+            event: StasisStart event data
+        """
+        channel_id = event.get("channel", {}).get("id")
+        self.logger.info(f"Call entered Stasis application: {channel_id}")
+
+        # Answer the channel if not already answered
+        channel_state = event.get("channel", {}).get("state")
+        if channel_state != "Up":
+            await self.ari.answer_channel(channel_id)
+
+    async def _handle_channel_state_change(self, event: dict):
+        """
+        Handle channel state changes.
+
+        Args:
+            event: ChannelStateChange event data
+        """
+        channel_id = event.get("channel", {}).get("id")
+        state = event.get("channel", {}).get("state")
+
+        self.logger.info(f"Channel {channel_id} state changed to: {state}")
+
+        # When channel is answered, start the audio bridge
+        if state == "Up" and channel_id == self.current_channel_id:
+            await self._start_conversation(channel_id)
+
+    async def _start_conversation(self, channel_id: str):
+        """
+        Start the conversation with OpenAI.
+
+        Args:
+            channel_id: Channel ID to start conversation on
+        """
+        self.logger.info(f"Starting conversation on channel {channel_id}")
+
+        try:
+            # Create audio bridge using RTP
+            self.bridge = AudioBridgeRTP(self.ari, self.openai, self.logger)
+
+            # Start bridging audio (this will run until call ends or wake detected)
+            await self.bridge.start(channel_id)
+
+        except Exception as e:
+            self.logger.error(f"Error in conversation: {e}", exc_info=True)
+            await self._end_call()
+
+    async def _handle_wake_detected(self):
+        """Handle wake keyword detection."""
+        self.logger.info("User is awake! Ending call.")
+        await self._end_call()
+
+    async def _handle_hangup_request(self, event: dict):
+        """
+        Handle hangup request.
+
+        Args:
+            event: ChannelHangupRequest event data
+        """
+        channel_id = event.get("channel", {}).get("id")
+        self.logger.info(f"Hangup requested for channel {channel_id}")
+
+    async def _handle_channel_destroyed(self, event: dict):
+        """
+        Handle channel destruction.
+
+        Args:
+            event: ChannelDestroyed event data
+        """
+        channel_id = event.get("channel", {}).get("id")
+        cause_txt = event.get("cause_txt", "Unknown")
+        cause = event.get("cause", 0)
+
+        self.logger.info(f"Channel {channel_id} destroyed: {cause_txt} (cause: {cause})")
+
+        if channel_id == self.current_channel_id:
+            self.call_active = False
+            
+            # Log different causes for debugging
+            if cause == 16:  # Normal clearing
+                self.logger.info("Call ended normally")
+            elif cause == 21:  # User busy
+                self.logger.warning("User was busy - call not answered")
+            elif cause == 27:  # Destination out of order
+                self.logger.error("Destination out of order - check phone number")
+            elif cause == 34:  # Circuit/channel congestion
+                self.logger.error("Circuit congestion - trunk may be unavailable")
+            else:
+                self.logger.warning(f"Call ended with cause {cause}: {cause_txt}")
+            
+            await self._cleanup()
+
+    async def _end_call(self):
+        """End the current call."""
+        if self.current_channel_id and self.call_active:
+            self.logger.info("Ending call")
+
+            try:
+                await self.ari.hangup_channel(self.current_channel_id)
+            except Exception as e:
+                self.logger.error(f"Error hanging up channel: {e}")
+
+            self.call_active = False
+
+    async def _cleanup(self):
+        """Clean up resources gracefully."""
+        self.logger.info("Cleaning up resources")
+
+        try:
+            if self.bridge:
+                await self.bridge.stop()
+        except Exception as e:
+            self.logger.error(f"Error stopping audio bridge: {e}", exc_info=True)
+
+        try:
+            if self.openai:
+                await self.openai.close()
+        except Exception as e:
+            self.logger.error(f"Error closing OpenAI connection: {e}", exc_info=True)
+
+        self.current_channel_id = None
+        self.bridge = None

@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker-compose up:*)",
+      "Bash(cat:*)",
+      "Bash(docker rm:*)",
+      "Bash(docker-compose logs:*)",
+      "Bash(ssh:*)",
+      "Bash(curl:*)",
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "Bash(chmod:*)",
+      "Bash(./test_ari_credentials.sh:*)",
+      "Bash(source:*)",
+      "Bash(echo:*)",
+      "Bash(docker-compose restart:*)",
+      "Bash(docker-compose down:*)",
+      "Bash(python3:*)",
+      "Bash(./diagnose_trunk.sh:*)",
+      "Bash(docker-compose build:*)",
+      "Bash(docker-compose ps:*)",
+      "Bash(docker exec:*)",
+      "Bash(ip route:*)",
+      "Bash(ss -tlnp:*)",
+      "Bash(lsof:*)",
+      "Bash(sudo lsof:*)",
+      "Bash(sudo iptables:*)",
+      "Bash(timeout 20 docker-compose logs:*)",
+      "Bash(docker logs:*)"
+    ]
+  }
+}

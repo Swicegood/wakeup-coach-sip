@@ -1,0 +1,22 @@
+version: '3.7'
+
+services:
+  wakeup-coach:
+    build: .
+    container_name: wakeup-coach
+    env_file:
+      - .env
+    environment:
+      - ASTERISK_EXTERNAL_MEDIA_FORMAT=slin
+      - ASTERISK_RTP_PAYLOAD_TYPE=10
+      - RTP_PORT=18000
+      # RTP_RELAY_HOST: RTP relay host (default: 10.0.10.91)
+      # RTP_RELAY_PORT: RTP relay port (default: 30000)
+      # The relay forwards RTP bidirectionally between Asterisk and this app
+    restart: unless-stopped
+    network_mode: host
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
