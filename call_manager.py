@@ -57,6 +57,7 @@ class CallManager:
         self.call_backoff_seconds = 2  # Wait 2 seconds before calling back
         self.should_call_back = True  # Flag to control call-back loop
         self.sleep_detected = False  # Only call back if sleep was detected
+        self.conversation_starting = False  # Flag to prevent race conditions during conversation setup
 
     async def start(self):
         """Start the call manager and initiate a wake-up call."""
@@ -235,7 +236,7 @@ class CallManager:
                 self.current_channel_id = channel.get("id")
                 self.call_active = True
                 self.state = CallState.CALL_ACTIVE
-                self.last_user_response_time = datetime.now()  # Initialize response tracking
+                # Don't set last_user_response_time here - wait for actual user speech
                 self.logger.info(f"Call originated successfully: {self.current_channel_id}")
                 return
 
@@ -264,7 +265,7 @@ class CallManager:
             self.current_channel_id = channel_id
             self.state = CallState.CALL_ACTIVE
             self.call_active = True
-            self.last_user_response_time = datetime.now()
+            # Don't set last_user_response_time here - wait for actual user speech
             
             if channel_state != "Up":
                 await self.ari.answer_channel(channel_id)
@@ -294,11 +295,17 @@ class CallManager:
         if state == "Up" and channel_id == self.current_channel_id and not self.bridge:
             self.logger.info(f"Call answered, starting conversation")
             self.state = CallState.CALL_ACTIVE
-            self.last_user_response_time = datetime.now()
+            # Don't set last_user_response_time here - wait for actual user speech
             await self._start_conversation(channel_id)
 
     async def _start_conversation(self, channel_id: str):
         """Start the conversation with OpenAI."""
+        # Prevent race conditions - only one conversation setup at a time
+        if self.conversation_starting:
+            self.logger.warning(f"Conversation already starting, ignoring for {channel_id}")
+            return
+        
+        self.conversation_starting = True
         self.logger.info(f"Starting conversation on channel {channel_id}")
 
         try:
@@ -322,16 +329,43 @@ class CallManager:
 
         except Exception as e:
             self.logger.error(f"Error in conversation: {e}", exc_info=True)
-            await self._end_call()
+            # Just cleanup - don't stop callback loop on errors
+            await self._cleanup()
+            self.call_active = False
+            self.state = CallState.CALL_ENDED
+        finally:
+            self.conversation_starting = False
 
     async def _sleep_detection_loop(self):
         """Continuously check if user has stopped responding (10 seconds of silence)."""
         self.logger.info(f"Sleep detection loop started. Interval: {self.sleep_check_interval}s")
         loop_count = 0
         
-        # Keep running as long as call is active (any state except ended)
+        # Wait for greeting to complete before starting silence detection
+        # This gives time for: test tone (1s) + OpenAI greeting (~5-10s) + buffer
+        initial_grace_period = 15  # seconds
+        self.logger.info(f"Sleep detection: waiting {initial_grace_period}s for greeting to complete...")
+        
+        # Wait for grace period OR until user speaks (whichever comes first)
+        grace_start = datetime.now()
         while self.call_active and self.state != CallState.CALL_ENDED:
-            # Check every second for responsive detection
+            await asyncio.sleep(1)
+            elapsed = (datetime.now() - grace_start).total_seconds()
+            
+            # If user has spoken, we can start the silence timer
+            if self.last_user_response_time:
+                self.logger.info(f"User spoke during grace period - starting silence detection")
+                break
+            
+            # Grace period complete
+            if elapsed >= initial_grace_period:
+                self.logger.info(f"Grace period complete ({initial_grace_period}s) - starting silence detection")
+                # Set last_user_response_time to now so the 10s timer starts
+                self.last_user_response_time = datetime.now()
+                break
+        
+        # Main silence detection loop
+        while self.call_active and self.state != CallState.CALL_ENDED:
             await asyncio.sleep(1)
             loop_count += 1
             
@@ -339,7 +373,7 @@ class CallManager:
                 self.logger.info("Sleep detection loop: call no longer active, exiting")
                 break
             
-            # Check if user has responded recently (only when in CALL_ACTIVE state)
+            # Check for silence (only when in CALL_ACTIVE state)
             if self.last_user_response_time and self.state == CallState.CALL_ACTIVE:
                 time_since_response = (datetime.now() - self.last_user_response_time).total_seconds()
                 
@@ -351,10 +385,6 @@ class CallManager:
                 if time_since_response >= self.sleep_check_interval:
                     self.logger.info(f"No user response for {time_since_response:.1f}s, prompting for sleep check...")
                     await self._prompt_sleep_check()
-            else:
-                # Log waiting for first response
-                if loop_count % 10 == 0:
-                    self.logger.debug(f"Sleep detection: waiting for first user response (last_user_response_time={self.last_user_response_time}, state={self.state})")
 
     async def _prompt_sleep_check(self):
         """Prompt user with 'Are you sleeping?' and wait for response."""
@@ -365,17 +395,29 @@ class CallManager:
         self.state = CallState.WAITING_FOR_USER_AFTER_SLEEP_PROMPT
         self.user_response_detected = False
         
-        # Send prompt to OpenAI (it will speak it)
+        # Send prompt to OpenAI and trigger it to speak
         if self.openai and self.openai.ws:
+            # Create the message
             prompt_message = {
                 "type": "conversation.item.create",
                 "item": {
                     "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "Are you sleeping?"}]
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Ask me if I'm sleeping - just say 'Are you sleeping?' and nothing else."}]
                 }
             }
             await self.openai.ws.send(json.dumps(prompt_message))
+            
+            # Trigger OpenAI to respond (speak the message)
+            response_create = {
+                "type": "response.create",
+                "response": {
+                    "modalities": ["audio", "text"],
+                    "instructions": "Ask if the user is sleeping. Just say 'Are you sleeping?' - keep it very brief."
+                }
+            }
+            await self.openai.ws.send(json.dumps(response_create))
+            self.logger.info("Sleep check prompt sent to OpenAI")
         
         # Wait for user response
         self.sleep_prompt_task = asyncio.create_task(self._wait_for_sleep_prompt_response())
