@@ -33,6 +33,8 @@ class CallConfig:
     target_phone_number: str
     wake_keyword: str
     wake_up_time: Optional[str] = None  # Time in HH:MM format (24-hour), e.g., "07:00"
+    call_immediately: bool = False  # If True, skip waiting for scheduled time (for testing)
+    timezone: str = "UTC"  # Timezone for wake-up time, e.g., "America/New_York", "US/Eastern"
 
 
 @dataclass
@@ -95,10 +97,13 @@ def load_config() -> Config:
     )
 
     # Load call configuration
+    call_immediately = get_env("CALL_IMMEDIATELY", "false", required=False).lower() in ("true", "1", "yes")
     call = CallConfig(
         target_phone_number=get_env("TARGET_PHONE_NUMBER"),
         wake_keyword=get_env("WAKE_KEYWORD", "awake"),
-        wake_up_time=get_env("WAKE_UP_TIME", None, required=False) or None  # Optional: e.g., "07:00"
+        wake_up_time=get_env("WAKE_UP_TIME", None, required=False) or None,  # Optional: e.g., "07:00"
+        call_immediately=call_immediately,
+        timezone=get_env("TIMEZONE", "UTC", required=False)  # Optional: e.g., "America/New_York"
     )
 
     # Load HTTP server configuration

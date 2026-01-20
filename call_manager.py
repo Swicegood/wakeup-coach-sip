@@ -8,6 +8,17 @@ from typing import Optional, Callable
 from datetime import datetime, time as dt_time, timedelta
 from enum import Enum
 
+# Try to use zoneinfo (Python 3.9+), fallback to pytz
+try:
+    from zoneinfo import ZoneInfo
+    HAS_ZONEINFO = True
+except ImportError:
+    try:
+        import pytz
+        HAS_ZONEINFO = False
+    except ImportError:
+        raise ImportError("Either zoneinfo (Python 3.9+) or pytz is required for timezone support")
+
 from ari_client import ARIClient
 from openai_client import OpenAIRealtimeClient
 from audio_bridge_rtp import AudioBridgeRTP
@@ -202,6 +213,11 @@ class CallManager:
 
     async def _wait_for_wake_time(self):
         """Wait until the scheduled wake-up time before calling."""
+        # If CALL_IMMEDIATELY is set, skip waiting
+        if self.config.call.call_immediately:
+            self.logger.info("CALL_IMMEDIATELY=true - calling immediately (testing mode)")
+            return
+        
         if not self.config.call.wake_up_time:
             self.logger.info("No wake-up time configured, calling immediately")
             return
@@ -214,8 +230,35 @@ class CallManager:
             self.logger.warning(f"Invalid wake-up time format '{self.config.call.wake_up_time}', calling immediately: {e}")
             return
 
-        now = datetime.now()
-        wake_datetime = datetime.combine(now.date(), wake_time)
+        # Get timezone-aware current time
+        try:
+            if HAS_ZONEINFO:
+                tz = ZoneInfo(self.config.call.timezone)
+                utc_tz = ZoneInfo("UTC")
+            else:
+                import pytz
+                tz = pytz.timezone(self.config.call.timezone)
+                utc_tz = pytz.UTC
+            self.logger.info(f"Using timezone: {self.config.call.timezone}")
+        except Exception as e:
+            self.logger.warning(f"Invalid timezone '{self.config.call.timezone}', using UTC: {e}")
+            if HAS_ZONEINFO:
+                tz = ZoneInfo("UTC")
+                utc_tz = ZoneInfo("UTC")
+            else:
+                import pytz
+                tz = pytz.UTC
+                utc_tz = pytz.UTC
+
+        now = datetime.now(tz)
+        # Create timezone-aware wake datetime
+        if HAS_ZONEINFO:
+            wake_datetime = datetime.combine(now.date(), wake_time, tz)
+        else:
+            import pytz
+            # With pytz, combine creates naive datetime, then localize it
+            naive_wake = datetime.combine(now.date(), wake_time)
+            wake_datetime = tz.localize(naive_wake)
 
         # If wake time has already passed today, schedule for tomorrow
         if wake_datetime <= now:
@@ -224,7 +267,13 @@ class CallManager:
         wait_seconds = (wake_datetime - now).total_seconds()
         wait_hours = wait_seconds / 3600
 
-        self.logger.info(f"Scheduled wake-up call for {wake_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+        # Log in both local timezone and UTC for clarity
+        now_utc = now.astimezone(utc_tz)
+        wake_utc = wake_datetime.astimezone(utc_tz)
+        self.logger.info(f"Current time ({self.config.call.timezone}): {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        self.logger.info(f"Current time (UTC): {now_utc.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        self.logger.info(f"Scheduled wake-up call ({self.config.call.timezone}): {wake_datetime.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        self.logger.info(f"Scheduled wake-up call (UTC): {wake_utc.strftime('%Y-%m-%d %H:%M:%S %Z')}")
         self.logger.info(f"Waiting {wait_hours:.2f} hours ({wait_seconds:.0f} seconds) until wake-up time...")
 
         # Wait until wake-up time
@@ -588,8 +637,29 @@ class CallManager:
                 self.logger.warning("Goodbye detected but doorbell webhook handler is None!")
             
             if doorbell_activated:
-                self.logger.info("User said goodbye and doorbell is activated - ending call permanently")
+                self.logger.info("User said goodbye and doorbell is activated - sending goodbye message then ending call")
                 self.should_call_back = False
+                
+                # Send an encouraging goodbye message via OpenAI and trigger it to speak
+                if self.openai and self.openai.ws:
+                    # Trigger OpenAI to respond with a goodbye message
+                    goodbye_response = {
+                        "type": "response.create",
+                        "response": {
+                            "modalities": ["audio", "text"],
+                            "instructions": "Say an encouraging goodbye message. Tell the user they did great staying awake and wish them a wonderful day. Keep it brief and warm - about 2-3 sentences."
+                        }
+                    }
+                    await self.openai.ws.send(json.dumps(goodbye_response))
+                    self.logger.info("Goodbye message sent to OpenAI - waiting for it to complete")
+                    
+                    # Wait for OpenAI to finish speaking (give it time to generate and speak the response)
+                    # A goodbye message typically takes 3-5 seconds to speak, plus generation time
+                    # We'll wait 10 seconds to ensure the message is fully delivered
+                    await asyncio.sleep(10)
+                    self.logger.info("Goodbye message should be complete, proceeding to hang up")
+                
+                # Now hang up after the goodbye message
                 await self._end_call()
             else:
                 self.logger.info("User said goodbye but doorbell not activated - refusing to end call")

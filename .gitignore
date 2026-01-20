@@ -1,5 +1,5 @@
 # Environment variables and secrets
-.env
+.env*
 *.key
 *.pem
 

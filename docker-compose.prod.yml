@@ -1,0 +1,25 @@
+version: '3.7'
+
+networks:
+  br1:
+    external: true
+
+services:
+  wakeup-coach:
+    build: /mnt/user/appdata/wakeup-coach-sip
+    container_name: wakeup-coach
+    env_file:
+      - .env
+    environment:
+      - ASTERISK_EXTERNAL_MEDIA_FORMAT=slin
+      - ASTERISK_RTP_PAYLOAD_TYPE=10
+      - RTP_PORT=18000
+    restart: unless-stopped
+    networks:
+      br1:
+        ipv4_address: 10.0.10.90
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
