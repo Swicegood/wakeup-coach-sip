@@ -74,18 +74,30 @@ class DoorbellWebhook:
         Returns:
             HTTP response
         """
+        self.logger.info(f"Doorbell webhook endpoint hit: method={request.method}, path={request.path}, remote={request.remote}")
         try:
-            # Parse request body
-            body = await request.body()
-            data = json.loads(body) if body else {}
+            # Try to parse request body if present (optional)
+            data = {}
+            try:
+                data = await request.json()
+            except (json.JSONDecodeError, ValueError, TypeError):
+                # If not JSON or no body, that's fine - we'll still activate
+                try:
+                    body = await request.read()
+                    if body:
+                        data = json.loads(body.decode('utf-8'))
+                except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+                    # Empty body or invalid JSON is fine
+                    pass
             
-            event_type = data.get('event_type', '').lower()
-            device_id = data.get('device_id', '')
+            event_type = data.get('event_type', '').lower() if data else ''
+            device_id = data.get('device_id', '') if data else ''
             
             self.logger.info(f"Doorbell webhook received: event_type={event_type}, device_id={device_id}")
-            self.logger.debug(f"Webhook payload: {data}")
+            if data:
+                self.logger.debug(f"Webhook payload: {data}")
             
-            # Activate doorbell (any valid webhook activates it)
+            # Activate doorbell (any POST to this endpoint activates it)
             await self.activate()
             
             return web.json_response({
@@ -110,5 +122,7 @@ class DoorbellWebhook:
     def create_app(self) -> web.Application:
         """Create aiohttp application with doorbell webhook route."""
         app = web.Application()
+        # Support both endpoint names for flexibility
         app.router.add_post('/doorbell-webhook', self.handle_webhook)
+        app.router.add_post('/activate-doorbell', self.handle_webhook)
         return app

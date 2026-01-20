@@ -45,6 +45,9 @@ class RTPServer:
 
         # Callbacks
         self.on_audio_received: Optional[Callable[[bytes, tuple], None]] = None
+        
+        # Flag to track if we've received the first packet (for relay endpoint learning)
+        self.first_packet_received = False
 
     async def start(self):
         """Start the RTP server."""
@@ -56,6 +59,9 @@ class RTPServer:
         self.port = self.sock.getsockname()[1]
 
         self.running = True
+        self.first_packet_received = False  # Reset for new call
+        self.sequence = 0  # Reset sequence for new call
+        self.timestamp = 0  # Reset timestamp for new call
         self.logger.info(f"RTP server started on port {self.port}")
 
         # Start receiving loop
@@ -105,8 +111,9 @@ class RTPServer:
                 
                 packets_received += 1
 
-                # Log first packet with full details
+                # Log first packet with full details and set flag
                 if packets_received == 1:
+                    self.first_packet_received = True  # Signal that relay has learned our endpoint
                     self.logger.info(f"FIRST RTP packet received from relay! {len(data)} bytes from {addr}. This confirms relay is forwarding packets!")
                 
                 # Log first few packets and every 100th packet

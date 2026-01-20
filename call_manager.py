@@ -58,7 +58,11 @@ class CallManager:
         self.should_call_back = True  # Flag to control call-back loop
         self.sleep_detected = False  # Only call back if sleep was detected
         self.conversation_starting = False  # Flag to prevent race conditions during conversation setup
+        self.cleaning_up = False  # Flag to prevent multiple cleanups
+        self.originating_call = False  # Flag to prevent concurrent call origination
         self.call_attempt = 0  # increments each originate; callbacks are attempts > 1
+        self.cleanup_complete = asyncio.Event()  # Event to signal cleanup is complete
+        self.cleanup_complete.set()  # Initially set (no cleanup needed)
 
     async def start(self):
         """Start the call manager and initiate a wake-up call."""
@@ -86,9 +90,11 @@ class CallManager:
 
             # Register event handlers
             self.ari.on_event("StasisStart", self._handle_stasis_start)
+            self.ari.on_event("StasisEnd", self._handle_stasis_end)
             self.ari.on_event("ChannelStateChange", self._handle_channel_state_change)
             self.ari.on_event("ChannelHangupRequest", self._handle_hangup_request)
             self.ari.on_event("ChannelDestroyed", self._handle_channel_destroyed)
+            self.logger.info(f"Registered event handlers: {list(self.ari.event_handlers.keys())}")
 
             # Connect to OpenAI
             await self.openai.connect()
@@ -164,6 +170,24 @@ class CallManager:
                 # Also check if channel still exists (if we can query it)
                 # For now, rely on events
             
+            # Wait for cleanup to complete before calling back
+            # This prevents race conditions where a new call starts before the old one is fully cleaned up
+            # Clear the event first (in case cleanup hasn't started yet) then wait for it
+            if not self.cleaning_up:
+                # Cleanup hasn't started yet - clear the event so we wait for it
+                self.cleanup_complete.clear()
+                self.logger.info("Call ended, waiting for cleanup to start and complete...")
+            else:
+                self.logger.info("Cleanup already in progress, waiting for it to complete...")
+            
+            try:
+                await asyncio.wait_for(self.cleanup_complete.wait(), timeout=5.0)
+                self.logger.info("Cleanup complete, proceeding with callback")
+            except asyncio.TimeoutError:
+                self.logger.warning("Cleanup timeout - proceeding anyway (may have timing issues)")
+                # Set the event so we don't block next time
+                self.cleanup_complete.set()
+            
             # Call back if:
             # - Sleep was explicitly detected (via silence + no response to prompt)
             # - User hung up (they might have fallen asleep)
@@ -210,47 +234,57 @@ class CallManager:
 
     async def _originate_call(self):
         """Originate a wake-up call with retry logic."""
-        # Use Local channel through wakeup-trigger context which:
-        # 1. Dials out via PJSIP trunk
-        # 2. Uses G() option to enter Stasis on the PJSIP leg after answer
-        # The dialplan calls Stasis(wakeup-coach) on the answered PJSIP channel
-        number = self.config.call.target_phone_number
+        # Prevent duplicate calls - if a call is already active or being originated, skip
+        if self.originating_call or self.call_active or self.current_channel_id:
+            self.logger.warning(f"Skipping duplicate call origination - originating: {self.originating_call}, active: {self.call_active}, channel: {self.current_channel_id}")
+            return
         
-        # Remove leading + for dialplan routing
-        dial_number = number.lstrip("+")
-        # Use wakeup-trigger context which Dial()s out, then uses G() to enter Stasis on the PJSIP leg
-        endpoint = f"Local/{dial_number}@wakeup-trigger"
-        context = "wakeup-trigger"
+        self.originating_call = True
+        try:
+            # Use Local channel through wakeup-trigger context which:
+            # 1. Dials out via PJSIP trunk
+            # 2. Uses G() option to enter Stasis on the PJSIP leg after answer
+            # The dialplan calls Stasis(wakeup-coach) on the answered PJSIP channel
+            number = self.config.call.target_phone_number
+            
+            # Remove leading + for dialplan routing
+            dial_number = number.lstrip("+")
+            # Use wakeup-trigger context which Dial()s out, then uses G() to enter Stasis on the PJSIP leg
+            endpoint = f"Local/{dial_number}@wakeup-trigger"
+            context = "wakeup-trigger"
 
-        self.logger.info(f"Originating call: endpoint={endpoint}, extension={dial_number}@{context}")
+            self.logger.info(f"Originating call: endpoint={endpoint}, extension={dial_number}@{context}")
 
-        max_retries = 3
-        retry_delay = 5  # seconds
+            max_retries = 3
+            retry_delay = 5  # seconds
 
-        for attempt in range(1, max_retries + 1):
-            try:
-                channel = await self.ari.originate_call(
-                    endpoint=endpoint,
-                    caller_id="Wake Up Coach",
-                    extension=dial_number,
-                    context=context
-                )
-                self.current_channel_id = channel.get("id")
-                self.call_active = True
-                self.state = CallState.CALL_ACTIVE
-                # Don't set last_user_response_time here - wait for actual user speech
-                self.logger.info(f"Call originated successfully: {self.current_channel_id}")
-                return
+            for attempt in range(1, max_retries + 1):
+                try:
+                    channel = await self.ari.originate_call(
+                        endpoint=endpoint,
+                        caller_id="Wake Up Coach",
+                        extension=dial_number,
+                        context=context
+                    )
+                    self.current_channel_id = channel.get("id")
+                    self.call_active = True
+                    self.state = CallState.CALL_ACTIVE
+                    self.cleanup_complete.set()  # Ensure cleanup_complete is set for new call
+                    # Don't set last_user_response_time here - wait for actual user speech
+                    self.logger.info(f"Call originated successfully: {self.current_channel_id}")
+                    return
 
-            except Exception as e:
-                self.logger.error(f"Failed to originate call (attempt {attempt}/{max_retries}): {e}")
-                
-                if attempt < max_retries:
-                    self.logger.info(f"Retrying in {retry_delay} seconds...")
-                    await asyncio.sleep(retry_delay)
-                else:
-                    self.logger.error("Failed to originate call after all retries.")
-                    self.call_active = False
+                except Exception as e:
+                    self.logger.error(f"Failed to originate call (attempt {attempt}/{max_retries}): {e}")
+                    
+                    if attempt < max_retries:
+                        self.logger.info(f"Retrying in {retry_delay} seconds...")
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        self.logger.error("Failed to originate call after all retries.")
+                        self.call_active = False
+        finally:
+            self.originating_call = False
 
     async def _handle_stasis_start(self, event: dict):
         """Handle StasisStart event when call enters the application."""
@@ -283,6 +317,44 @@ class CallManager:
             if self.current_channel_id and not self.bridge:
                 self.logger.info(f"Starting conversation via external media channel")
                 await self._start_conversation(self.current_channel_id)
+
+    async def _handle_stasis_end(self, event: dict):
+        """Handle StasisEnd event when a channel leaves the Stasis application."""
+        self.logger.info(f"StasisEnd handler called! Event: {event}")
+        channel = event.get("channel", {})
+        channel_id = channel.get("id")
+        channel_name = channel.get("name", "")
+
+        self.logger.info(f"StasisEnd: channel={channel_id}, name={channel_name}, current_channel_id={self.current_channel_id}, call_active={self.call_active}, bridge={self.bridge is not None}")
+
+        # Handle PJSIP channel leaving Stasis - this means the call ended
+        # Check by channel_id match OR if it's a PJSIP channel and we still have a bridge (cleanup might have cleared current_channel_id)
+        if channel_name.startswith("PJSIP/") and (channel_id == self.current_channel_id or (self.bridge is not None and self.call_active)):
+            self.logger.info(f"PJSIP channel {channel_id} left Stasis - call ended (user hung up)")
+            self.call_active = False
+            self.state = CallState.CALL_ENDED
+            self.cleanup_complete.clear()  # Clear event so callback loop waits for cleanup
+            
+            # IMMEDIATELY close OpenAI to stop it from sending audio
+            if self.openai and self.openai.ws:
+                self.logger.info("Closing OpenAI connection IMMEDIATELY to stop audio...")
+                try:
+                    await self.openai.close()
+                    self.logger.info("OpenAI connection closed")
+                except Exception as e:
+                    self.logger.error(f"Error closing OpenAI: {e}")
+            
+            # IMMEDIATELY stop audio bridge
+            if self.bridge:
+                self.logger.info("Stopping audio bridge IMMEDIATELY...")
+                try:
+                    await self.bridge.stop()
+                    self.logger.info("Audio bridge stopped")
+                except Exception as e:
+                    self.logger.error(f"Error stopping audio bridge: {e}")
+                self.bridge = None
+            
+            await self._cleanup()
 
     async def _handle_channel_state_change(self, event: dict):
         """Handle channel state changes."""
@@ -351,7 +423,17 @@ class CallManager:
         # Wait for grace period OR until user speaks (whichever comes first)
         grace_start = datetime.now()
         while self.call_active and self.state != CallState.CALL_ENDED:
-            await asyncio.sleep(1)
+            # Check call_active more frequently to respond to hangups faster
+            for _ in range(5):  # 5 * 0.2s = 1s total
+                if not self.call_active or self.state == CallState.CALL_ENDED:
+                    self.logger.info("Sleep detection loop: call ended during grace period, exiting")
+                    return
+                try:
+                    await asyncio.sleep(0.2)
+                except asyncio.CancelledError:
+                    self.logger.info("Sleep detection loop cancelled during grace period")
+                    raise
+            
             elapsed = (datetime.now() - grace_start).total_seconds()
             
             # If user has spoken, we can start the silence timer
@@ -367,26 +449,36 @@ class CallManager:
                 break
         
         # Main silence detection loop
-        while self.call_active and self.state != CallState.CALL_ENDED:
-            await asyncio.sleep(1)
-            loop_count += 1
-            
-            if not self.call_active:
-                self.logger.info("Sleep detection loop: call no longer active, exiting")
-                break
-            
-            # Check for silence (only when in CALL_ACTIVE state)
-            if self.last_user_response_time and self.state == CallState.CALL_ACTIVE:
-                time_since_response = (datetime.now() - self.last_user_response_time).total_seconds()
+        try:
+            while self.call_active and self.state != CallState.CALL_ENDED:
+                # Check call_active more frequently (every 0.2s instead of 1s) to respond to hangups faster
+                for _ in range(5):  # 5 * 0.2s = 1s total
+                    if not self.call_active or self.state == CallState.CALL_ENDED:
+                        self.logger.info("Sleep detection loop: call no longer active, exiting immediately")
+                        return  # Exit immediately, don't continue
+                    try:
+                        await asyncio.sleep(0.2)
+                    except asyncio.CancelledError:
+                        self.logger.info("Sleep detection loop cancelled")
+                        raise
                 
-                # Log every 5 seconds
-                if loop_count % 5 == 0:
-                    self.logger.debug(f"Sleep detection: {time_since_response:.1f}s since last response (threshold: {self.sleep_check_interval}s)")
+                loop_count += 1
                 
-                # If no response for sleep_check_interval (10 seconds), prompt user
-                if time_since_response >= self.sleep_check_interval:
-                    self.logger.info(f"No user response for {time_since_response:.1f}s, prompting for sleep check...")
-                    await self._prompt_sleep_check()
+                # Check for silence (only when in CALL_ACTIVE state)
+                if self.last_user_response_time and self.state == CallState.CALL_ACTIVE:
+                    time_since_response = (datetime.now() - self.last_user_response_time).total_seconds()
+                    
+                    # Log every 5 seconds
+                    if loop_count % 5 == 0:
+                        self.logger.debug(f"Sleep detection: {time_since_response:.1f}s since last response (threshold: {self.sleep_check_interval}s)")
+                    
+                    # If no response for sleep_check_interval (10 seconds), prompt user
+                    if time_since_response >= self.sleep_check_interval:
+                        self.logger.info(f"No user response for {time_since_response:.1f}s, prompting for sleep check...")
+                        await self._prompt_sleep_check()
+        except asyncio.CancelledError:
+            self.logger.info("Sleep detection loop cancelled")
+            raise
 
     async def _prompt_sleep_check(self):
         """Prompt user with 'Are you sleeping?' and wait for response."""
@@ -426,8 +518,25 @@ class CallManager:
 
     async def _wait_for_sleep_prompt_response(self):
         """Wait for user response after sleep prompt."""
-        await asyncio.sleep(self.sleep_prompt_response_wait)
+        # Check call_active frequently during wait to respond to hangups immediately
+        wait_iterations = int(self.sleep_prompt_response_wait / 0.2)  # Check every 0.2s
+        for _ in range(wait_iterations):
+            if not self.call_active or self.state == CallState.CALL_ENDED:
+                self.logger.info("Call ended while waiting for sleep prompt response, exiting")
+                return
+            if self.user_response_detected:
+                # User responded, return to normal conversation
+                self.logger.info("User responded to sleep prompt, continuing conversation")
+                self.state = CallState.CALL_ACTIVE
+                self.last_user_response_time = datetime.now()
+                return
+            try:
+                await asyncio.sleep(0.2)
+            except asyncio.CancelledError:
+                self.logger.info("Sleep prompt response wait cancelled")
+                raise
         
+        # Wait complete - check if user responded
         if not self.user_response_detected and self.call_active:
             # No response - user is sleeping, hang up and call back
             self.logger.info("No response to sleep prompt - user appears to be sleeping. Hanging up to call back...")
@@ -470,7 +579,15 @@ class CallManager:
         # Check for goodbye/end call with doorbell requirement
         transcript_lower = transcript.lower().strip()
         if any(word in transcript_lower for word in ["goodbye", "end call", "hang up"]):
-            if self.doorbell and self.doorbell.is_activated():
+            doorbell_activated = False
+            if self.doorbell:
+                doorbell_activated = self.doorbell.is_activated()
+                activation_time = self.doorbell.get_activation_time()
+                self.logger.info(f"Goodbye detected - doorbell exists: {self.doorbell is not None}, activated: {doorbell_activated}, activation_time: {activation_time}")
+            else:
+                self.logger.warning("Goodbye detected but doorbell webhook handler is None!")
+            
+            if doorbell_activated:
                 self.logger.info("User said goodbye and doorbell is activated - ending call permanently")
                 self.should_call_back = False
                 await self._end_call()
@@ -496,8 +613,107 @@ class CallManager:
 
     async def _handle_hangup_request(self, event: dict):
         """Handle hangup request."""
-        channel_id = event.get("channel", {}).get("id")
-        self.logger.info(f"Hangup requested for channel {channel_id}")
+        channel = event.get("channel", {})
+        channel_id = channel.get("id")
+        channel_name = channel.get("name", "")
+        
+        self.logger.info(f"Hangup requested for channel {channel_id} ({channel_name})")
+        
+        # If it's a Local channel hangup during an active call, check if PJSIP channel is still in Stasis
+        # This handles cases where user hangs up and we only get Local channel hangups
+        if channel_name.startswith("Local/") and self.call_active and self.current_channel_id:
+            try:
+                # Check if PJSIP channel is still in Stasis
+                channel_info = await self.ari.get_channel(self.current_channel_id)
+                if not channel_info or channel_info.get("state") != "Up":
+                    self.logger.info(f"PJSIP channel {self.current_channel_id} no longer in Stasis - user hung up")
+                    # Trigger cleanup as if PJSIP channel hung up
+                    self.call_active = False
+                    self.state = CallState.CALL_ENDED
+                    self.cleanup_complete.clear()
+                    
+                    # IMMEDIATELY close OpenAI and stop bridge
+                    if self.openai and self.openai.ws:
+                        self.logger.info("Closing OpenAI connection IMMEDIATELY to stop audio...")
+                        try:
+                            await self.openai.close()
+                        except Exception as e:
+                            self.logger.error(f"Error closing OpenAI: {e}")
+                    
+                    if self.bridge:
+                        self.logger.info("Stopping audio bridge IMMEDIATELY...")
+                        try:
+                            await self.bridge.stop()
+                        except Exception as e:
+                            self.logger.error(f"Error stopping audio bridge: {e}")
+                        self.bridge = None
+                    
+                    await self._cleanup()
+                    return
+            except Exception as e:
+                # Channel doesn't exist - user hung up
+                self.logger.info(f"PJSIP channel {self.current_channel_id} not found: {e} - user hung up")
+                self.call_active = False
+                self.state = CallState.CALL_ENDED
+                self.cleanup_complete.clear()
+                
+                # IMMEDIATELY close OpenAI and stop bridge
+                if self.openai and self.openai.ws:
+                    self.logger.info("Closing OpenAI connection IMMEDIATELY to stop audio...")
+                    try:
+                        await self.openai.close()
+                    except Exception as e:
+                        self.logger.error(f"Error closing OpenAI: {e}")
+                
+                if self.bridge:
+                    self.logger.info("Stopping audio bridge IMMEDIATELY...")
+                    try:
+                        await self.bridge.stop()
+                    except Exception as e:
+                        self.logger.error(f"Error stopping audio bridge: {e}")
+                    self.bridge = None
+                
+                await self._cleanup()
+                return
+        
+        # If it's the PJSIP channel (the actual phone call), end the call immediately
+        if channel_name.startswith("PJSIP/") and channel_id == self.current_channel_id:
+            self.logger.info(f"PJSIP channel {channel_id} hangup requested - ending call immediately")
+            self.call_active = False
+            self.state = CallState.CALL_ENDED
+            self.cleanup_complete.clear()  # Clear event so callback loop waits for cleanup
+            
+            # IMMEDIATELY close OpenAI to stop it from sending audio
+            if self.openai and self.openai.ws:
+                self.logger.info("Closing OpenAI connection IMMEDIATELY to stop audio...")
+                try:
+                    await self.openai.close()
+                    self.logger.info("OpenAI connection closed")
+                except Exception as e:
+                    self.logger.error(f"Error closing OpenAI: {e}")
+            
+            # IMMEDIATELY stop audio bridge to stop sending packets
+            if self.bridge:
+                self.logger.info("Stopping audio bridge IMMEDIATELY to stop sending packets...")
+                try:
+                    await self.bridge.stop()
+                    self.logger.info("Audio bridge stopped")
+                except Exception as e:
+                    self.logger.error(f"Error stopping audio bridge: {e}")
+                # Clear bridge reference so cleanup doesn't try again
+                self.bridge = None
+            
+            # Cancel sleep detection tasks immediately to prevent them from detecting "silence"
+            current_task = asyncio.current_task()
+            if self.sleep_check_task and self.sleep_check_task != current_task:
+                self.logger.info("Cancelling sleep detection task immediately")
+                self.sleep_check_task.cancel()
+            if self.sleep_prompt_task and self.sleep_prompt_task != current_task:
+                self.logger.info("Cancelling sleep prompt task immediately")
+                self.sleep_prompt_task.cancel()
+            
+            # Do rest of cleanup (but OpenAI and bridge are already done)
+            await self._cleanup()
 
     async def _handle_channel_destroyed(self, event: dict):
         """Handle channel destruction."""
@@ -514,13 +730,19 @@ class CallManager:
             self.logger.debug(f"Ignoring Local channel destruction: {channel_name}")
             return
 
-        if channel_id == self.current_channel_id:
+        # Handle PJSIP channel destruction - this means the call ended
+        # Check by ID, or if it's a PJSIP channel and we have an active call (bridge exists or call_active)
+        # This handles cases where call_active was already set to False by another handler
+        if (channel_id == self.current_channel_id or 
+            (channel_name.startswith("PJSIP/") and (self.call_active or self.bridge is not None))):
+            self.logger.info(f"PJSIP channel destroyed - call ended (user hung up)")
             self.call_active = False
             self.state = CallState.CALL_ENDED
+            self.cleanup_complete.clear()  # Clear event so callback loop waits for cleanup
             
             # Log different causes for debugging
             if cause == 16:  # Normal clearing
-                self.logger.info("Call ended normally")
+                self.logger.info("Call ended normally (user hung up)")
             elif cause == 21:  # User busy
                 self.logger.warning("User was busy - call not answered")
             elif cause == 27:  # Destination out of order
@@ -530,21 +752,87 @@ class CallManager:
             else:
                 self.logger.warning(f"Call ended with cause {cause}: {cause_txt}")
             
+            # IMMEDIATELY close OpenAI to stop it from sending audio
+            if self.openai and self.openai.ws:
+                self.logger.info("Closing OpenAI connection IMMEDIATELY to stop audio...")
+                try:
+                    await self.openai.close()
+                    self.logger.info("OpenAI connection closed")
+                except Exception as e:
+                    self.logger.error(f"Error closing OpenAI: {e}")
+            
+            # IMMEDIATELY stop audio bridge
+            if self.bridge:
+                self.logger.info("Stopping audio bridge IMMEDIATELY...")
+                try:
+                    await self.bridge.stop()
+                    self.logger.info("Audio bridge stopped")
+                except Exception as e:
+                    self.logger.error(f"Error stopping audio bridge: {e}")
+                self.bridge = None
+            
             await self._cleanup()
 
     async def _end_call(self):
         """End the current call."""
-        if self.current_channel_id and self.call_active:
-            self.logger.info("Ending call")
+        # Even if call_active was flipped False by some other handler, if we still have
+        # a current_channel_id we should attempt to hang it up (goodbye + doorbell).
+        if self.current_channel_id:
+            # IMPORTANT: hang up FIRST. Stopping OpenAI / bridge can block and delay hangup otherwise.
+            channel_id = self.current_channel_id
+
+            self.logger.info("Ending call (user said goodbye with doorbell activated) - hanging up immediately")
             self.should_call_back = False  # Don't call back if ending normally
-
-            try:
-                await self.ari.hangup_channel(self.current_channel_id)
-            except Exception as e:
-                self.logger.error(f"Error hanging up channel: {e}")
-
             self.call_active = False
             self.state = CallState.CALL_ENDED
+            self.cleanup_complete.clear()  # let callback loop (if still running) wait for cleanup
+
+            # Cancel sleep detection tasks immediately
+            current_task = asyncio.current_task()
+            if self.sleep_check_task and self.sleep_check_task != current_task:
+                self.logger.info("Cancelling sleep detection task immediately")
+                self.sleep_check_task.cancel()
+            if self.sleep_prompt_task and self.sleep_prompt_task != current_task:
+                self.logger.info("Cancelling sleep prompt task immediately")
+                self.sleep_prompt_task.cancel()
+
+            # Hang up the channel FIRST (bounded time)
+            try:
+                await asyncio.wait_for(self.ari.hangup_channel(channel_id), timeout=2.0)
+                self.logger.info(f"Hangup sent for channel {channel_id}")
+            except asyncio.TimeoutError:
+                self.logger.warning(f"Timeout sending hangup for channel {channel_id} (continuing cleanup)")
+            except Exception as e:
+                self.logger.error(f"Error hanging up channel {channel_id}: {e}")
+
+            # Then stop OpenAI / bridge + cleanup, but don't allow this to delay hangup
+            async def _post_hangup_cleanup():
+                # IMMEDIATELY close OpenAI to stop it from sending audio
+                if self.openai and self.openai.ws:
+                    self.logger.info("Closing OpenAI connection IMMEDIATELY to stop audio...")
+                    try:
+                        await asyncio.wait_for(self.openai.close(), timeout=2.0)
+                        self.logger.info("OpenAI connection closed")
+                    except asyncio.TimeoutError:
+                        self.logger.warning("Timeout closing OpenAI (continuing cleanup)")
+                    except Exception as e:
+                        self.logger.error(f"Error closing OpenAI: {e}")
+
+                # IMMEDIATELY stop audio bridge to stop sending packets
+                if self.bridge:
+                    self.logger.info("Stopping audio bridge IMMEDIATELY...")
+                    try:
+                        await asyncio.wait_for(self.bridge.stop(), timeout=3.0)
+                        self.logger.info("Audio bridge stopped")
+                    except asyncio.TimeoutError:
+                        self.logger.warning("Timeout stopping audio bridge (continuing cleanup)")
+                    except Exception as e:
+                        self.logger.error(f"Error stopping audio bridge: {e}")
+                    self.bridge = None  # Clear bridge reference so cleanup doesn't try again
+
+                await self._cleanup()
+
+            asyncio.create_task(_post_hangup_cleanup())
 
     async def _end_call_for_sleep(self):
         """End call because user appears to be sleeping (will call back)."""
@@ -557,14 +845,22 @@ class CallManager:
             except Exception as e:
                 self.logger.error(f"Error hanging up channel: {e}")
 
-            # Clean up resources (audio bridge, OpenAI) before callback
-            await self._cleanup()
-            
             self.call_active = False
             self.state = CallState.CALL_ENDED
+            self.cleanup_complete.clear()  # Clear event so callback loop waits for cleanup
+            
+            # Clean up resources (audio bridge, OpenAI) before callback
+            await self._cleanup()
 
     async def _cleanup(self):
         """Clean up resources gracefully."""
+        # Prevent multiple cleanups
+        if self.cleaning_up:
+            self.logger.debug("Cleanup already in progress, skipping")
+            return
+        
+        self.cleaning_up = True
+        self.cleanup_complete.clear()  # Signal that cleanup is starting
         self.logger.info("Cleaning up resources")
 
         # Cancel sleep detection tasks (but not if we're being called from one of them!)
@@ -578,16 +874,23 @@ class CallManager:
 
         try:
             if self.bridge:
+                self.logger.info("Stopping audio bridge...")
                 await self.bridge.stop()
+                self.logger.info("Audio bridge stopped")
         except Exception as e:
             self.logger.error(f"Error stopping audio bridge: {e}", exc_info=True)
 
         try:
             if self.openai:
+                self.logger.info("Closing OpenAI connection...")
                 await self.openai.close()
+                self.logger.info("OpenAI connection closed")
         except Exception as e:
             self.logger.error(f"Error closing OpenAI connection: {e}", exc_info=True)
 
         self.current_channel_id = None
         self.bridge = None
         self.last_user_response_time = None
+        self.cleaning_up = False
+        self.cleanup_complete.set()  # Signal that cleanup is complete
+        self.logger.info("Cleanup complete")

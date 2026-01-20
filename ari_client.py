@@ -112,8 +112,13 @@ class ARIClient:
                         event_type = event.get("type")
 
                         self.logger.debug(f"Received ARI event: {event_type}")
+                        
+                        # Log StasisEnd events at INFO level to debug
+                        if event_type == "StasisEnd":
+                            self.logger.info(f"StasisEnd event received: {event}")
 
                         if event_type in self.event_handlers:
+                            self.logger.debug(f"Calling handler for {event_type}")
                             await self.event_handlers[event_type](event)
                         else:
                             self.logger.debug(f"No handler for event type: {event_type}")

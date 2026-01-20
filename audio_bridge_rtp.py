@@ -43,6 +43,7 @@ class AudioBridgeRTP:
         self.rtp_relay_host: Optional[str] = None
         self.rtp_relay_port: Optional[int] = None
         self.bridge_id: Optional[str] = None
+        self.streaming_tasks: list[asyncio.Task] = []  # Store task references for cancellation
 
     async def start(self, phone_channel_id: str, prime_rtp: bool = False):
         """
@@ -157,25 +158,37 @@ class AudioBridgeRTP:
             # Wait a bit for RTP path to fully establish after channel goes Up
             await asyncio.sleep(0.3)
 
-            # ALWAYS send priming packets to wake up the RTP path
+            # Send priming packets to wake up the RTP path
             # Asterisk won't send us packets until we send it something first
-            # This is especially critical for callbacks where the relay may have cached the old endpoint
-            self.logger.info("Sending RTP priming packets to wake up bidirectional path...")
+            # On callbacks, send more priming packets to ensure relay learns new endpoint
+            num_priming_packets = 10 if prime_rtp else 5
+            priming_duration_ms = num_priming_packets * 20
+            if prime_rtp:
+                self.logger.info(f"Callback detected: sending {num_priming_packets} RTP priming packets ({priming_duration_ms}ms) to establish relay path...")
+            else:
+                self.logger.info(f"Sending {num_priming_packets} RTP priming packets ({priming_duration_ms}ms) to wake up bidirectional path...")
+            
             silence_24k = b'\x00' * 960  # 20ms @ 24kHz PCM16
-            for i in range(5):  # Send 5 packets (100ms of silence)
+            for i in range(num_priming_packets):
                 if self.rtp_server and self.rtp_relay_host:
                     self.rtp_server.send_audio(silence_24k, self.rtp_relay_host, self.rtp_relay_port)
                 await asyncio.sleep(0.02)  # 20ms between packets
             
+            # On callbacks, wait a bit longer for relay to learn new endpoint
+            if prime_rtp:
+                await asyncio.sleep(0.2)
+            
             # Now wait for Asterisk to respond (this confirms bidirectional path)
-            self.logger.info("Waiting for first incoming RTP packet to confirm bidirectional path (max 1.5s)...")
-            for _ in range(15):  # 15 * 0.1s = 1.5 seconds max
+            wait_timeout = 2.0 if prime_rtp else 1.5  # Longer timeout on callbacks
+            wait_iterations = int(wait_timeout * 10)  # 0.1s per iteration
+            self.logger.info(f"Waiting for first incoming RTP packet to confirm bidirectional path (max {wait_timeout}s)...")
+            for _ in range(wait_iterations):
                 if hasattr(self.rtp_server, 'first_packet_received') and self.rtp_server.first_packet_received:
                     self.logger.info("First RTP packet received - bidirectional path confirmed!")
                     break
                 await asyncio.sleep(0.1)
             else:
-                self.logger.warning("No incoming RTP after 1.5s - proceeding anyway (may have audio issues)")
+                self.logger.warning(f"No incoming RTP after {wait_timeout}s - proceeding anyway (may have audio issues)")
 
             # Small delay to let path settle
             await asyncio.sleep(0.1)
@@ -191,14 +204,16 @@ class AudioBridgeRTP:
             await self._send_initial_message()
 
             # Start audio streaming tasks
-            # Use gather with return_exceptions=True to handle individual task failures
+            # Create tasks explicitly so we can cancel them later
+            self.streaming_tasks = [
+                asyncio.create_task(self._stream_openai_to_rtp()),
+                asyncio.create_task(self._listen_for_openai_responses()),
+                asyncio.create_task(self._rtp_keepalive()),
+            ]
+            
+            # Wait for tasks to complete (they will run until self.running = False)
             try:
-                await asyncio.gather(
-                    self._stream_openai_to_rtp(),
-                    self._listen_for_openai_responses(),
-                    self._rtp_keepalive(),  # Keepalive to maintain NAT mappings
-                    return_exceptions=True
-                )
+                await asyncio.gather(*self.streaming_tasks, return_exceptions=True)
             except Exception as e:
                 self.logger.error(f"Error in audio streaming tasks: {e}", exc_info=True)
                 raise
@@ -215,6 +230,24 @@ class AudioBridgeRTP:
         """Stop the audio bridge."""
         self.logger.info("Stopping audio bridge")
         self.running = False
+
+        # Cancel streaming tasks immediately
+        if self.streaming_tasks:
+            self.logger.info(f"Cancelling {len(self.streaming_tasks)} streaming tasks...")
+            for task in self.streaming_tasks:
+                if not task.done():
+                    task.cancel()
+            # Wait for tasks to be cancelled (with timeout)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self.streaming_tasks, return_exceptions=True),
+                    timeout=1.0
+                )
+            except asyncio.TimeoutError:
+                self.logger.warning("Some streaming tasks didn't cancel within timeout")
+            except Exception as e:
+                self.logger.debug(f"Tasks cancelled: {e}")
+            self.streaming_tasks = []
 
         # Stop RTP server
         if self.rtp_server:
@@ -457,6 +490,11 @@ class AudioBridgeRTP:
                         # No data - send silence to maintain timing
                         chunk = b'\x00' * chunk_size_24k  # 480 samples of silence at 24kHz
 
+                # Check if we should still be running
+                if not self.running:
+                    self.logger.info("Streaming task stopping (running=False)")
+                    break
+                
                 # Always send a packet to maintain timing, even if it's silence
                 # Send to RTP relay, which forwards to Asterisk
                 if self.rtp_server and self.rtp_relay_host:
@@ -497,9 +535,15 @@ class AudioBridgeRTP:
                             self.logger.warning(f"Timing reset: {(current_time - next_packet_time)*1000:.1f}ms behind")
                         next_packet_time = current_time
 
+            except asyncio.CancelledError:
+                self.logger.info("OpenAI to RTP streaming task cancelled")
+                break
             except Exception as e:
                 self.logger.error(f"Error streaming to RTP: {e}", exc_info=True)
-                await asyncio.sleep(0.1)
+                if self.running:
+                    await asyncio.sleep(0.1)
+                else:
+                    break
 
     async def _rtp_keepalive(self):
         """
@@ -537,9 +581,15 @@ class AudioBridgeRTP:
                         self.logger.warning("RTP keepalive: RTP server or relay not configured, skipping")
                     await asyncio.sleep(keepalive_interval)
                     
+            except asyncio.CancelledError:
+                self.logger.info("RTP keepalive task cancelled")
+                break
             except Exception as e:
                 self.logger.error(f"Error in RTP keepalive: {e}", exc_info=True)
-                await asyncio.sleep(keepalive_interval)
+                if self.running:
+                    await asyncio.sleep(keepalive_interval)
+                else:
+                    break
 
     async def _listen_for_openai_responses(self):
         """Listen for audio responses from OpenAI."""
@@ -549,5 +599,7 @@ class AudioBridgeRTP:
             # This calls the OpenAI client's listener which processes websocket messages
             # and populates the audio buffer via _handle_audio_delta()
             await self.openai.listen_for_responses()
+        except asyncio.CancelledError:
+            self.logger.info("OpenAI listener task cancelled")
         except Exception as e:
             self.logger.error(f"Error in OpenAI listener: {e}", exc_info=True)
