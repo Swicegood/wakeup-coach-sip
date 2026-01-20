@@ -2,125 +2,116 @@
 
 ## What's Working ✅
 
-1. **Call Origination**: Successfully originates calls using Local channel format through FreePBX dialplan
-   - Routes through configured outbound routes
-   - Call connects and reaches target phone
+### Core Functionality
+1. **Call Origination**: Successfully originates calls via Local channel through FreePBX dialplan
+   - Routes through `wakeup-trigger` context with `Dial()` and `G()` option
+   - PJSIP channel enters Stasis after answer
+   - Local channel destruction is correctly ignored
 
-2. **ARI Integration**: Full ARI WebSocket connection and event handling
+2. **ARI Integration**: Full ARI WebSocket connection with auto-reconnect
    - Authentication working
-   - Event handlers registered
-   - Channel lifecycle managed
+   - Event handlers for StasisStart, ChannelDestroyed, ChannelStateChange
+   - WebSocket auto-reconnects if connection drops
 
-3. **OpenAI Integration**: OpenAI Realtime API connection established
-   - Session initialized
-   - Ready to send/receive audio
-   - Wake keyword detection configured
+3. **OpenAI Realtime API**: Bidirectional audio streaming working
+   - Fresh session created for each call
+   - VAD (Voice Activity Detection) with tuned thresholds
+   - Real-time transcription and response generation
 
-4. **Bridge Architecture**: Proper ARI bridge and channel management
-   - Mixing bridge created
-   - Call channel added to bridge
-   - Resource cleanup working
+4. **RTP Audio Bridge**: Full bidirectional audio via RTP relay
+   - External media channel connects to RTP relay
+   - Audio flows: Phone ↔ Asterisk ↔ RTP Relay ↔ App ↔ OpenAI
+   - Proper sample rate handling (8kHz/16kHz/24kHz)
 
-## Critical Gap: Audio Streaming ❌
+5. **Sleep Detection**: Working silence detection and callback
+   - Detects 10 seconds of silence
+   - Prompts "Are you sleeping?"
+   - Waits 10 seconds for response
+   - Hangs up and calls back if no response
 
-### The Problem
+6. **Callback Loop**: Reliable callback after hang-up
+   - Calls back when user hangs up (assumes they fell asleep)
+   - Only stops calling back when user says "goodbye" AND doorbell is activated
+   - Race condition protection with `conversation_starting` flag
+   - No duplicate calls on hang-up
 
-ARI does not provide a simple WebSocket-based audio streaming mechanism. Audio in ARI works through:
+7. **Doorbell Integration**: Webhook ready for doorbell trigger
+   - HTTP endpoint for doorbell signal
+   - Combined with "goodbye" keyword to end callbacks
 
-1. **Snoop channels**: Can capture audio but don't expose a WebSocket endpoint for streaming
-2. **External media channels**: Require RTP/UDP packet handling, not HTTP/WebSocket
-3. **Play API**: Requires pre-recorded files accessible to Asterisk
+## Recent Fixes (2026-01-20)
 
-### What's Needed
+1. **Fixed duplicate calls on hang-up**: Added `conversation_starting` flag to prevent race conditions during conversation setup
 
-To complete bidirectional audio, we need to implement **RTP packet handling**:
+2. **Fixed ARI WebSocket disconnection**: Added auto-reconnect loop so callbacks receive events
+
+3. **Fixed Local channel handling**: Now correctly ignores Local channel destruction (only tracks PJSIP channels)
+
+4. **Fixed callback loop stopping on errors**: Errors in conversation setup no longer stop the callback loop
+
+## Architecture
 
 ```
-┌─────────────┐     RTP/UDP     ┌──────────┐
-│   OpenAI    │ ←─────────────→ │ Asterisk │
-│  (via app)  │                 │   ARI    │
-└─────────────┘                 └──────────┘
+┌─────────────┐     WebSocket      ┌──────────────┐
+│   OpenAI    │ ←───────────────→  │  wakeup-coach │
+│  Realtime   │     (audio)        │     app       │
+└─────────────┘                    └──────┬───────┘
+                                          │ RTP/UDP
+                                          ↓
+                                   ┌──────────────┐
+                                   │  RTP Relay   │
+                                   │ (10.0.10.91) │
+                                   └──────┬───────┘
+                                          │ RTP/UDP
+                                          ↓
+┌─────────────┐     PJSIP/SIP      ┌──────────────┐
+│    Phone    │ ←───────────────→  │   Asterisk   │
+│             │                    │   FreePBX    │
+└─────────────┘                    └──────────────┘
 ```
 
-### Implementation Options
+## Configuration
 
-#### Option 1: RTP Server (Recommended)
-- Implement UDP socket server
-- Parse/generate RTP packets
-- Connect to external media channel's RTP endpoint
-- **Complexity**: Medium-High
-- **Latency**: Low
-- **Libraries**: `aiortc` or custom RTP implementation
+### Environment Variables
+- `PHONE_NUMBER`: Target phone number
+- `WAKE_KEYWORD`: Word to end callbacks (default: "goodbye")
+- `ASTERISK_ARI_*`: ARI connection settings
+- `OPENAI_API_KEY`: OpenAI API key
+- `EXTERNAL_RTP_HOST`: RTP relay IP
+- `EXTERNAL_RTP_HOST_PORT`: RTP relay port
 
-#### Option 2: Media Server Bridge
-- Deploy Janus/Freeswitch as RTP bridge
-- Connect Asterisk ↔ Media Server ↔ Application
-- **Complexity**: High (additional infrastructure)
-- **Latency**: Medium
-- **Reliability**: High
+### Dialplan (extensions_custom.conf)
+```ini
+[wakeup-trigger]
+exten => _X.,1,NoOp(Wake-up Coach: Dialing ${EXTEN})
+ same => n,Dial(PJSIP/${EXTEN}@voipms,60,G(wakeup-answered^s^1))
+ same => n,Hangup()
 
-#### Option 3: Asterisk Module
-- Write custom Asterisk module
-- Direct audio injection into channels
-- **Complexity**: Very High (C programming, Asterisk internals)
-- **Latency**: Lowest
-- **Maintainability**: Low
-
-## Test Results
-
-### Latest Test Run (2026-01-10 17:43:02)
-```
-✅ Service started
-✅ ARI WebSocket connected
-✅ OpenAI Realtime API connected
-✅ Call originated to Local/19199129332@from-internal
-✅ Call answered (channels went Up)
-✅ Audio bridge simplified - call stays alive
-✅ OpenAI session initialized
-✅ Initial message sent to OpenAI
-⚠️  No audio streaming in either direction (expected - not yet implemented)
-✅ Call stays connected (does not hang up immediately)
+[wakeup-answered]
+exten => s,1,NoOp(Call answered - determining channel type)
+ same => n,GotoIf($["${CHANNEL(channeltype)}" = "PJSIP"]?pjsip:hangup)
+ same => n(pjsip),NoOp(Entering Stasis on outbound PJSIP leg: ${CHANNEL})
+ same => n,Stasis(wakeup-coach)
+ same => n,Hangup()
+ same => n(hangup),NoOp(Hanging up non-PJSIP leg: ${CHANNEL})
+ same => n,Hangup()
 ```
 
-### User Experience
-- User receives call ✅
-- Call connects ✅
-- Call stays connected ✅
-- Silence in both directions (expected - audio not implemented) ⚠️
-- Can hang up normally ✅
-
-## Next Steps
-
-### Immediate (MVP with Audio)
-1. Implement basic RTP server using `aiortc` or similar
-2. Connect RTP server to external media channel
-3. Stream audio bidirectionally: Phone ↔ RTP Server ↔ OpenAI
-4. Test end-to-end conversation
-
-### Alternative Quick Win
-Use Asterisk's built-in features:
-1. Have OpenAI generate TTS responses
-2. Save as temp files in Asterisk-accessible location
-3. Use ARI play API to play responses
-4. **Trade-off**: Higher latency, but simpler implementation
-
-## Files Modified
-
-- `call_manager.py`: Updated to use Local channel format ✅
-- `ari_client.py`: Added bridge methods, external media support ✅
-- `audio_bridge.py`: Attempted WebSocket streaming (doesn't work for audio) ❌
-- `openai_client.py`: Working, ready for audio ✅
-
-## Command to Test Current State
+## Test Command
 
 ```bash
-docker-compose up -d && docker-compose logs -f
+docker-compose down && docker-compose build wakeup-coach && docker-compose up wakeup-coach
 ```
 
-The service will:
-- Start successfully
-- Connect to both Asterisk and OpenAI
-- Originate the call
-- Call will ring and connect
-- No audio (expected - not yet implemented)
-- Call will stay connected until hang up
+## Behavior Summary
+
+1. App starts → connects to ARI WebSocket → connects to OpenAI
+2. Originates call via `Local/number@wakeup-trigger`
+3. Asterisk dials out via PJSIP trunk
+4. On answer, PJSIP channel enters Stasis
+5. App creates bridge + external media channel
+6. OpenAI session started, initial greeting sent
+7. Bidirectional conversation flows
+8. If 10s silence → "Are you sleeping?" → 10s wait → hang up + callback
+9. If user says "goodbye" + doorbell activated → end permanently
+10. If user hangs up without goodbye → callback in 2 seconds
