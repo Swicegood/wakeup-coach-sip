@@ -44,12 +44,14 @@ class AudioBridgeRTP:
         self.rtp_relay_port: Optional[int] = None
         self.bridge_id: Optional[str] = None
 
-    async def start(self, phone_channel_id: str):
+    async def start(self, phone_channel_id: str, prime_rtp: bool = False):
         """
         Start bridging audio for a channel.
 
         Args:
             phone_channel_id: Phone channel ID
+            prime_rtp: If True, send a short burst of RTP silence before the test tone.
+                This helps the external RTP relay "learn" the endpoint on callback calls.
         """
         self.phone_channel_id = phone_channel_id
         self.running = True
@@ -152,8 +154,38 @@ class AudioBridgeRTP:
             else:
                 self.logger.warning(f"External media channel still in {media_state} state after 5 seconds - proceeding anyway")
 
+            # Wait a bit for RTP path to fully establish after channel goes Up
+            await asyncio.sleep(0.3)
+
+            # ALWAYS send priming packets to wake up the RTP path
+            # Asterisk won't send us packets until we send it something first
+            # This is especially critical for callbacks where the relay may have cached the old endpoint
+            self.logger.info("Sending RTP priming packets to wake up bidirectional path...")
+            silence_24k = b'\x00' * 960  # 20ms @ 24kHz PCM16
+            for i in range(5):  # Send 5 packets (100ms of silence)
+                if self.rtp_server and self.rtp_relay_host:
+                    self.rtp_server.send_audio(silence_24k, self.rtp_relay_host, self.rtp_relay_port)
+                await asyncio.sleep(0.02)  # 20ms between packets
+            
+            # Now wait for Asterisk to respond (this confirms bidirectional path)
+            self.logger.info("Waiting for first incoming RTP packet to confirm bidirectional path (max 1.5s)...")
+            for _ in range(15):  # 15 * 0.1s = 1.5 seconds max
+                if hasattr(self.rtp_server, 'first_packet_received') and self.rtp_server.first_packet_received:
+                    self.logger.info("First RTP packet received - bidirectional path confirmed!")
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                self.logger.warning("No incoming RTP after 1.5s - proceeding anyway (may have audio issues)")
+
+            # Small delay to let path settle
+            await asyncio.sleep(0.1)
+
             # Send a test tone FIRST to verify audio path
+            # This ensures the audio path is working before we start the conversation
             await self._send_test_tone()
+            
+            # Small delay after test tone to ensure it completes before starting OpenAI audio
+            await asyncio.sleep(0.1)
 
             # Send initial message to OpenAI
             await self._send_initial_message()

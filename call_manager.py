@@ -58,6 +58,7 @@ class CallManager:
         self.should_call_back = True  # Flag to control call-back loop
         self.sleep_detected = False  # Only call back if sleep was detected
         self.conversation_starting = False  # Flag to prevent race conditions during conversation setup
+        self.call_attempt = 0  # increments each originate; callbacks are attempts > 1
 
     async def start(self):
         """Start the call manager and initiate a wake-up call."""
@@ -133,6 +134,7 @@ class CallManager:
             self.sleep_detected = False
             
             # Originate the call
+            self.call_attempt += 1
             await self._originate_call()
             
             if not self.call_active:
@@ -325,7 +327,7 @@ class CallManager:
             self.sleep_check_task = asyncio.create_task(self._sleep_detection_loop())
 
             # Start bridging audio (this will run until call ends or wake detected)
-            await self.bridge.start(channel_id)
+            await self.bridge.start(channel_id, prime_rtp=(self.call_attempt > 1))
 
         except Exception as e:
             self.logger.error(f"Error in conversation: {e}", exc_info=True)
