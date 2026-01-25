@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 from typing import Optional, Callable
 
 import websockets
@@ -39,6 +40,7 @@ class OpenAIRealtimeClient:
         self.on_audio_data: Optional[Callable] = None
         self.on_wake_detected: Optional[Callable] = None
         self.on_user_speech: Optional[Callable] = None  # Callback for user speech/transcription
+        self.on_ai_speech_finished: Optional[Callable] = None  # Callback when AI finishes speaking
 
         # Audio buffer for RTP streaming
         self.audio_buffer = bytearray()
@@ -47,6 +49,11 @@ class OpenAIRealtimeClient:
         # Rolling stats for audio rate debugging
         self._audio_bytes_since_log = 0
         self._audio_last_log_ts = asyncio.get_event_loop().time()
+        
+        # Track when OpenAI is speaking
+        self._is_speaking = False
+        self._last_audio_delta_time: Optional[float] = None
+        self._speech_finished_task: Optional[asyncio.Task] = None
 
     async def connect(self):
         """Connect to OpenAI Realtime API WebSocket."""
@@ -64,12 +71,26 @@ class OpenAIRealtimeClient:
                 self.audio_buffer.clear()
                 self.logger.info("Audio buffer cleared for fresh connection")
             
+            # Reset speaking state
+            self._is_speaking = False
+            self._last_audio_delta_time = None
+            if self._speech_finished_task:
+                try:
+                    self._speech_finished_task.cancel()
+                except Exception:
+                    pass
+                self._speech_finished_task = None
+            
             # Increase ping timeout to prevent premature disconnection
+            # Use longer timeouts for production environments where network may be less stable
+            ping_interval = int(os.getenv("OPENAI_WS_PING_INTERVAL", "30"))  # seconds
+            ping_timeout = int(os.getenv("OPENAI_WS_PING_TIMEOUT", "120"))  # 2 minutes instead of 1
+            self.logger.info(f"OpenAI WebSocket: ping_interval={ping_interval}s, ping_timeout={ping_timeout}s")
             self.ws = await websockets.connect(
                 url,
                 additional_headers=headers,
-                ping_interval=30,
-                ping_timeout=60,
+                ping_interval=ping_interval,
+                ping_timeout=ping_timeout,
             )
             self.logger.info("Connected to OpenAI Realtime API")
             await self._initialize_session()
@@ -145,19 +166,41 @@ class OpenAIRealtimeClient:
         try:
             async for message in self.ws:
                 if not self.ws:  # Check if connection still valid
-                    self.logger.warning("WebSocket closed during listen")
+                    self.logger.warning("⚠️ WebSocket closed during listen")
                     break
                 try:
                     event = json.loads(message)
                     event_type = event.get("type")
 
                     self.logger.debug(f"OpenAI event: {event_type}")
+                    
+                    # Log connection health periodically
+                    if event_type in ["response.created", "response.done", "conversation.item.input_audio_transcription.completed"]:
+                        self.logger.debug(f"OpenAI connection healthy - received {event_type}")
 
                     if event_type == "response.audio.delta":
                         await self._handle_audio_delta(event)
+                    elif event_type == "response.done":
+                        # OpenAI finished speaking
+                        self.logger.info("OpenAI response.done event - AI finished speaking")
+                        await self._handle_speech_finished()
+                    elif event_type == "response.created":
+                        # OpenAI started a new response
+                        self.logger.debug("OpenAI response.created event - AI started speaking")
+                        self._is_speaking = True
+                        self._last_audio_delta_time = None  # Reset since this is a new response
+                        # Cancel any pending speech finished task
+                        if self._speech_finished_task:
+                            try:
+                                self._speech_finished_task.cancel()
+                            except Exception:
+                                pass
+                            self._speech_finished_task = None
                     elif event_type == "conversation.item.input_audio_transcription.completed":
                         # User input transcription
-                        self.logger.debug(f"User input transcription event: {event}")
+                        self.logger.info(f"🎤 User input transcription event received!")
+                        self.logger.info(f"Event keys: {list(event.keys())}")
+                        self.logger.debug(f"Full event: {event}")
                         await self._handle_transcription(event)
                     elif event_type == "response.audio_transcript.done":
                         # This is the AI's transcription of its own output, not user input
@@ -208,10 +251,12 @@ class OpenAIRealtimeClient:
                 except Exception as e:
                     self.logger.error(f"Error handling OpenAI event: {e}", exc_info=True)
 
-        except websockets.exceptions.ConnectionClosed:
-            self.logger.warning("OpenAI WebSocket connection closed")
+        except websockets.exceptions.ConnectionClosed as e:
+            self.logger.error(f"⚠️ OpenAI WebSocket connection closed unexpectedly: code={e.code}, reason={e.reason}")
+            self.logger.error(f"This may cause the call to end. Check network connectivity and OpenAI API status.")
         except Exception as e:
-            self.logger.error(f"Error in OpenAI listener: {e}", exc_info=True)
+            self.logger.error(f"⚠️ Error in OpenAI listener: {e}", exc_info=True)
+            self.logger.error(f"This may cause the call to end.")
 
     async def _handle_audio_delta(self, event: dict):
         """
@@ -223,6 +268,36 @@ class OpenAIRealtimeClient:
         audio_b64 = event.get("delta")
         if audio_b64:
             audio_bytes = base64.b64decode(audio_b64)
+            
+            # Mark that we're receiving audio (OpenAI is speaking)
+            self._is_speaking = True
+            self._last_audio_delta_time = asyncio.get_event_loop().time()
+            
+            # Cancel any pending speech finished task
+            if self._speech_finished_task:
+                try:
+                    self._speech_finished_task.cancel()
+                except Exception:
+                    pass  # Task might already be done/cancelled
+            
+            # Schedule a task to detect when speech finishes (no audio for 1.5 seconds)
+            async def _check_speech_finished():
+                try:
+                    await asyncio.sleep(1.5)  # Wait 1.5 seconds after last audio delta
+                    # Check if we're still not receiving audio and still speaking
+                    if self._last_audio_delta_time and self._is_speaking:
+                        now = asyncio.get_event_loop().time()
+                        time_since_last_audio = now - self._last_audio_delta_time
+                        if time_since_last_audio >= 1.5:
+                            self.logger.info(f"OpenAI finished speaking (no audio for {time_since_last_audio:.1f}s)")
+                            await self._handle_speech_finished()
+                except asyncio.CancelledError:
+                    # Task was cancelled because new audio arrived - this is expected
+                    pass
+                except Exception as e:
+                    self.logger.error(f"Error in _check_speech_finished: {e}", exc_info=True)
+            
+            self._speech_finished_task = asyncio.create_task(_check_speech_finished())
 
             # Debug: estimate OpenAI output sample rate from bytes/sec (mono PCM16)
             now = asyncio.get_event_loop().time()
@@ -248,6 +323,30 @@ class OpenAIRealtimeClient:
             # Call callback if set
             if self.on_audio_data:
                 await self.on_audio_data(audio_bytes)
+    
+    async def _handle_speech_finished(self):
+        """Handle when OpenAI finishes speaking."""
+        # Only process if we were actually speaking (prevents duplicate calls)
+        if not self._is_speaking:
+            return
+        
+        self._is_speaking = False
+        self._last_audio_delta_time = None
+        
+        # Cancel any pending speech finished task
+        if self._speech_finished_task:
+            try:
+                self._speech_finished_task.cancel()
+            except Exception:
+                pass
+            self._speech_finished_task = None
+        
+        # Notify callback that AI finished speaking
+        if self.on_ai_speech_finished:
+            try:
+                await self.on_ai_speech_finished()
+            except Exception as e:
+                self.logger.error(f"Error in on_ai_speech_finished callback: {e}", exc_info=True)
 
     async def _handle_transcription(self, event: dict):
         """
@@ -267,8 +366,9 @@ class OpenAIRealtimeClient:
         
         # Log the event for debugging if transcript is missing
         if not transcript:
-            self.logger.debug(f"Transcription event structure: {list(event.keys())}")
-            self.logger.debug(f"Event content (first 500 chars): {str(event)[:500]}")
+            self.logger.warning(f"⚠️ Transcription event received but no transcript found!")
+            self.logger.warning(f"Event structure keys: {list(event.keys())}")
+            self.logger.warning(f"Event content (first 1000 chars): {str(event)[:1000]}")
             return
         
         transcript_lower = transcript.lower().strip()
@@ -291,6 +391,16 @@ class OpenAIRealtimeClient:
             await self.ws.close()
             self.ws = None
             self.logger.info("OpenAI connection closed")
+        
+        # Reset speaking state
+        self._is_speaking = False
+        self._last_audio_delta_time = None
+        if self._speech_finished_task:
+            try:
+                self._speech_finished_task.cancel()
+            except Exception:
+                pass
+            self._speech_finished_task = None
         
         # Clear audio buffer on close
         async with self.audio_lock:

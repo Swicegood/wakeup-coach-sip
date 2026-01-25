@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from typing import Optional, Callable
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime, timedelta, time as dt_time, timedelta
 from enum import Enum
 
 # Try to use zoneinfo (Python 3.9+), fallback to pytz
@@ -74,6 +74,8 @@ class CallManager:
         self.call_attempt = 0  # increments each originate; callbacks are attempts > 1
         self.cleanup_complete = asyncio.Event()  # Event to signal cleanup is complete
         self.cleanup_complete.set()  # Initially set (no cleanup needed)
+        self.goodbye_response_complete = asyncio.Event()  # Event to signal goodbye message is done
+        self.waiting_for_goodbye_response = False  # Flag to track if we're waiting for goodbye
 
     async def start(self):
         """Start the call manager and initiate a wake-up call."""
@@ -94,6 +96,7 @@ class CallManager:
         # Set up callbacks
         self.openai.on_user_speech = self._handle_user_speech  # Track user responses
         self.openai.on_wake_detected = self._handle_wake_detected
+        self.openai.on_ai_speech_finished = self._handle_ai_speech_finished  # Track when AI finishes speaking
 
         async with self.ari:
             # Connect to ARI WebSocket
@@ -295,7 +298,7 @@ class CallManager:
             # 2. Uses G() option to enter Stasis on the PJSIP leg after answer
             # The dialplan calls Stasis(wakeup-coach) on the answered PJSIP channel
             number = self.config.call.target_phone_number
-            
+
             # Remove leading + for dialplan routing
             dial_number = number.lstrip("+")
             # Use wakeup-trigger context which Dial()s out, then uses G() to enter Stasis on the PJSIP leg
@@ -352,10 +355,11 @@ class CallManager:
             self.call_active = True
             # Don't set last_user_response_time here - wait for actual user speech
             
+            # Answer if needed, then start conversation
             if channel_state != "Up":
                 await self.ari.answer_channel(channel_id)
             
-            # Start conversation if not already started
+            # Start conversation for PJSIP channels if not already started
             if not self.bridge:
                 await self._start_conversation(channel_id)
         
@@ -412,7 +416,7 @@ class CallManager:
         channel_name = event.get("channel", {}).get("name", "")
 
         self.logger.info(f"Channel {channel_id} ({channel_name}) state changed to: {state}")
-        
+
         # When originating a call, start conversation when it's answered
         # This handles the case where the channel doesn't explicitly enter Stasis
         if state == "Up" and channel_id == self.current_channel_id and not self.bridge:
@@ -464,12 +468,14 @@ class CallManager:
         self.logger.info(f"Sleep detection loop started. Interval: {self.sleep_check_interval}s")
         loop_count = 0
         
-        # Wait for greeting to complete before starting silence detection
+        # Wait for initial greeting to complete before starting silence detection
+        # The silence timer will be set when OpenAI finishes speaking (via _handle_ai_speech_finished)
         # This gives time for: test tone (1s) + OpenAI greeting (~5-10s) + buffer
-        initial_grace_period = 15  # seconds
-        self.logger.info(f"Sleep detection: waiting {initial_grace_period}s for greeting to complete...")
+        initial_grace_period = 20  # seconds - max wait for initial greeting
+        self.logger.info(f"Sleep detection: waiting for OpenAI to finish initial greeting (max {initial_grace_period}s)...")
         
-        # Wait for grace period OR until user speaks (whichever comes first)
+        # Wait for OpenAI to finish speaking (last_user_response_time will be set by _handle_ai_speech_finished)
+        # OR timeout after grace period
         grace_start = datetime.now()
         while self.call_active and self.state != CallState.CALL_ENDED:
             # Check call_active more frequently to respond to hangups faster
@@ -485,15 +491,14 @@ class CallManager:
             
             elapsed = (datetime.now() - grace_start).total_seconds()
             
-            # If user has spoken, we can start the silence timer
+            # If OpenAI has finished speaking (last_user_response_time is set), we can start the silence timer
             if self.last_user_response_time:
-                self.logger.info(f"User spoke during grace period - starting silence detection")
+                self.logger.info(f"OpenAI finished speaking - starting silence detection (timer set to {self.last_user_response_time})")
                 break
             
-            # Grace period complete
+            # Grace period timeout - set timer anyway (fallback if OpenAI speech finished callback didn't fire)
             if elapsed >= initial_grace_period:
-                self.logger.info(f"Grace period complete ({initial_grace_period}s) - starting silence detection")
-                # Set last_user_response_time to now so the 10s timer starts
+                self.logger.warning(f"Grace period complete ({initial_grace_period}s) but OpenAI speech finished callback didn't fire - starting silence detection anyway")
                 self.last_user_response_time = datetime.now()
                 break
         
@@ -517,13 +522,17 @@ class CallManager:
                 if self.last_user_response_time and self.state == CallState.CALL_ACTIVE:
                     time_since_response = (datetime.now() - self.last_user_response_time).total_seconds()
                     
+                    # Add 3-second buffer to give user time to process and respond after AI speaks
+                    buffer_seconds = 3.0
+                    effective_threshold = self.sleep_check_interval + buffer_seconds  # 10s + 3s = 13s total
+                    
                     # Log every 5 seconds
                     if loop_count % 5 == 0:
-                        self.logger.debug(f"Sleep detection: {time_since_response:.1f}s since last response (threshold: {self.sleep_check_interval}s)")
+                        self.logger.debug(f"Sleep detection: {time_since_response:.1f}s since AI finished speaking (threshold: {effective_threshold:.1f}s)")
                     
-                    # If no response for sleep_check_interval (10 seconds), prompt user
-                    if time_since_response >= self.sleep_check_interval:
-                        self.logger.info(f"No user response for {time_since_response:.1f}s, prompting for sleep check...")
+                    # If no response for effective_threshold (13 seconds total), prompt user
+                    if time_since_response >= effective_threshold:
+                        self.logger.info(f"No user response for {time_since_response:.1f}s after AI finished speaking (threshold: {effective_threshold:.1f}s), prompting for sleep check...")
                         await self._prompt_sleep_check()
         except asyncio.CancelledError:
             self.logger.info("Sleep detection loop cancelled")
@@ -533,7 +542,11 @@ class CallManager:
         """Prompt user with 'Are you sleeping?' and wait for response."""
         if self.state != CallState.CALL_ACTIVE:
             return
-        
+        # Avoid duplicate sleep check (e.g. race with user response setting state back)
+        if self.sleep_prompt_task and not self.sleep_prompt_task.done():
+            self.logger.debug("Sleep prompt already in progress, skipping")
+            return
+
         self.logger.info("Prompting user: 'Are you sleeping?'")
         self.state = CallState.WAITING_FOR_USER_AFTER_SLEEP_PROMPT
         self.user_response_detected = False
@@ -608,20 +621,24 @@ class CallManager:
             if self.state == CallState.WAITING_FOR_USER_AFTER_SLEEP_PROMPT:
                 self.user_response_detected = True
                 self.logger.info("VAD detected during sleep prompt - user responded")
+                self.state = CallState.CALL_ACTIVE
+                self.last_user_response_time = datetime.now()  # reset silence timer so we don't re-prompt in 1s
                 if self.sleep_prompt_task:
                     self.sleep_prompt_task.cancel()
             return
         
-        # Real transcription - reset silence timer and log
-        self.last_user_response_time = datetime.now()
+        # Real transcription - reset silence timer so a short pause (e.g. 3s) doesn't trigger sleep check
         self.logger.info(f"User said: {transcript[:100] if transcript else 'N/A'}")
-        self.logger.info(f"Reset last_user_response_time to {self.last_user_response_time}")
+        if self.state == CallState.CALL_ACTIVE:
+            self.last_user_response_time = datetime.now()
+            self.logger.debug("User spoke - reset silence timer (13s countdown restarts)")
         
         # Check if we're waiting for response to sleep prompt
         if self.state == CallState.WAITING_FOR_USER_AFTER_SLEEP_PROMPT:
             self.user_response_detected = True
             self.logger.info("User responded to sleep prompt, resuming normal conversation")
             self.state = CallState.CALL_ACTIVE  # Resume normal state immediately
+            self.last_user_response_time = datetime.now()  # reset silence timer so sleep loop doesn't re-prompt in 1s
             if self.sleep_prompt_task:
                 self.sleep_prompt_task.cancel()
         
@@ -642,6 +659,19 @@ class CallManager:
                 
                 # Send an encouraging goodbye message via OpenAI and trigger it to speak
                 if self.openai and self.openai.ws:
+                    # Reset and prepare to wait for goodbye response
+                    self.goodbye_response_complete.clear()
+                    self.waiting_for_goodbye_response = True
+                    
+                    # Cancel any ongoing response first
+                    try:
+                        cancel_response = {"type": "response.cancel"}
+                        await self.openai.ws.send(json.dumps(cancel_response))
+                        self.logger.info("Cancelled any ongoing OpenAI response")
+                        await asyncio.sleep(0.2)  # Brief pause for cancellation to process
+                    except Exception as e:
+                        self.logger.warning(f"Failed to cancel ongoing response: {e}")
+                    
                     # Trigger OpenAI to respond with a goodbye message
                     goodbye_response = {
                         "type": "response.create",
@@ -653,11 +683,13 @@ class CallManager:
                     await self.openai.ws.send(json.dumps(goodbye_response))
                     self.logger.info("Goodbye message sent to OpenAI - waiting for it to complete")
                     
-                    # Wait for OpenAI to finish speaking (give it time to generate and speak the response)
-                    # A goodbye message typically takes 3-5 seconds to speak, plus generation time
-                    # We'll wait 10 seconds to ensure the message is fully delivered
-                    await asyncio.sleep(10)
-                    self.logger.info("Goodbye message should be complete, proceeding to hang up")
+                    # Wait for OpenAI to finish speaking the goodbye message (max 15 seconds)
+                    try:
+                        await asyncio.wait_for(self.goodbye_response_complete.wait(), timeout=15.0)
+                        self.logger.info("Goodbye response completed, proceeding to hang up")
+                    except asyncio.TimeoutError:
+                        self.logger.warning("Goodbye response timeout after 15s - hanging up anyway")
+                        self.waiting_for_goodbye_response = False
                 
                 # Now hang up after the goodbye message
                 await self._end_call()
@@ -674,6 +706,23 @@ class CallManager:
                         }
                     }
                     await self.openai.ws.send(json.dumps(response_message))
+
+    async def _handle_ai_speech_finished(self):
+        """Handle when OpenAI finishes speaking - reset silence timer with buffer."""
+        # Check if we were waiting for a goodbye response
+        if self.waiting_for_goodbye_response:
+            self.logger.info("Goodbye response complete - signaling to hang up")
+            self.goodbye_response_complete.set()
+            self.waiting_for_goodbye_response = False
+            return  # Don't reset timers during goodbye
+        
+        if self.call_active and self.state == CallState.CALL_ACTIVE:
+            # Reset the silence timer to now - the buffer will be handled in the detection loop
+            self.last_user_response_time = datetime.now()
+            self.logger.info(f"AI finished speaking - reset silence timer to {self.last_user_response_time}")
+            self.logger.info(f"Silence detection active: will prompt after {self.sleep_check_interval}s of silence (with 3s buffer)")
+        else:
+            self.logger.debug(f"AI finished speaking but call not active (call_active={self.call_active}, state={self.state})")
 
     async def _handle_wake_detected(self):
         """Handle wake keyword detection (legacy - now handled by _handle_user_speech)."""

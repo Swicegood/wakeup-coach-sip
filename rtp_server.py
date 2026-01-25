@@ -45,7 +45,7 @@ class RTPServer:
 
         # Callbacks
         self.on_audio_received: Optional[Callable[[bytes, tuple], None]] = None
-        
+
         # Flag to track if we've received the first packet (for relay endpoint learning)
         self.first_packet_received = False
 

@@ -494,7 +494,7 @@ class AudioBridgeRTP:
                 if not self.running:
                     self.logger.info("Streaming task stopping (running=False)")
                     break
-                
+
                 # Always send a packet to maintain timing, even if it's silence
                 # Send to RTP relay, which forwards to Asterisk
                 if self.rtp_server and self.rtp_relay_host:
@@ -602,4 +602,7 @@ class AudioBridgeRTP:
         except asyncio.CancelledError:
             self.logger.info("OpenAI listener task cancelled")
         except Exception as e:
-            self.logger.error(f"Error in OpenAI listener: {e}", exc_info=True)
+            self.logger.error(f"⚠️ CRITICAL: Error in OpenAI listener: {e}", exc_info=True)
+            self.logger.error(f"⚠️ This will cause the bridge to stop and the call to end!")
+            # Don't re-raise - let the bridge handle it gracefully
+            # The bridge will stop when self.running = False

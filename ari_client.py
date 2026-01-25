@@ -112,7 +112,7 @@ class ARIClient:
                         event_type = event.get("type")
 
                         self.logger.debug(f"Received ARI event: {event_type}")
-                        
+                            
                         # Log StasisEnd events at INFO level to debug
                         if event_type == "StasisEnd":
                             self.logger.info(f"StasisEnd event received: {event}")
@@ -169,7 +169,7 @@ class ARIClient:
             payload["extension"] = extension
         if context:
             payload["context"] = context
-            
+
         self.logger.info(f"Originating call: endpoint={endpoint}, extension={extension}@{context}")
 
         async with self.session.post(url, json=payload) as resp:
