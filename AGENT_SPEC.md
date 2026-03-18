@@ -112,7 +112,7 @@ This project is successful when:
 
 ### Goal
 When the assistant stops getting responses (user falls asleep), the system should:
-1) Prompt the user with: **"Are you sleeping?"**
+1) Prompt the user with: **"Quick check-in: can you hear me?"**
 2) Wait **10 seconds** for a response
 3) If no response, **hang up** and **call back**
 4) Repeat the call-back cycle indefinitely **unless** the user ends the call via:
@@ -153,7 +153,7 @@ If user says "goodbye" but `doorbell_activated == False`:
 If the system detects a prolonged silence / no-user-response condition during the call (implementation-specific), run the following procedure:
 
 #### Procedure: sleep-check loop
-1) Speak: **"Are you sleeping?"**
+1) Speak: **"Quick check-in: can you hear me?"**
 2) Start a timer for **10 seconds**
 3) If any valid user audio / speech is detected within 10s:
    - Return to normal conversation handling

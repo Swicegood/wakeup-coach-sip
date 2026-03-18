@@ -60,7 +60,7 @@ class CallManager:
         self.last_user_response_time: Optional[datetime] = None
         self.sleep_check_interval = 10  # seconds - check for sleep after 10s of silence
         self.sleep_check_task: Optional[asyncio.Task] = None
-        self.sleep_prompt_response_wait = 10  # seconds to wait after "Are you sleeping?"
+        self.sleep_prompt_response_wait = 10  # seconds to wait after the sleep-check prompt
         self.sleep_prompt_task: Optional[asyncio.Task] = None
         self.user_response_detected = False  # Flag set when user responds during sleep prompt
         
@@ -539,7 +539,7 @@ class CallManager:
             raise
 
     async def _prompt_sleep_check(self):
-        """Prompt user with 'Are you sleeping?' and wait for response."""
+        """Prompt user with a quick, gentle check-in and wait for response."""
         if self.state != CallState.CALL_ACTIVE:
             return
         # Avoid duplicate sleep check (e.g. race with user response setting state back)
@@ -547,7 +547,7 @@ class CallManager:
             self.logger.debug("Sleep prompt already in progress, skipping")
             return
 
-        self.logger.info("Prompting user: 'Are you sleeping?'")
+        self.logger.info("Prompting user with quick gentle check-in...")
         self.state = CallState.WAITING_FOR_USER_AFTER_SLEEP_PROMPT
         self.user_response_detected = False
         
@@ -559,7 +559,7 @@ class CallManager:
                 "item": {
                     "type": "message",
                     "role": "user",
-                    "content": [{"type": "input_text", "text": "Ask me if I'm sleeping - just say 'Are you sleeping?' and nothing else."}]
+                    "content": [{"type": "input_text", "text": "Do a quick, gentle check-in. Ask: 'Can you hear me? Say yes if you are awake enough for one breath and one stretch.' Keep it very short."}]
                 }
             }
             await self.openai.ws.send(json.dumps(prompt_message))
@@ -569,7 +569,7 @@ class CallManager:
                 "type": "response.create",
                 "response": {
                     "modalities": ["audio", "text"],
-                    "instructions": "Ask if the user is sleeping. Just say 'Are you sleeping?' - keep it very brief."
+                    "instructions": "Ask the quick gentle check-in question only. Do not ask additional questions."
                 }
             }
             await self.openai.ws.send(json.dumps(response_create))
@@ -677,7 +677,7 @@ class CallManager:
                         "type": "response.create",
                         "response": {
                             "modalities": ["audio", "text"],
-                            "instructions": "Say an encouraging goodbye message. Tell the user they did great staying awake and wish them a wonderful day. Keep it brief and warm - about 2-3 sentences."
+                            "instructions": "Say an encouraging goodbye message. Focus on the present: tell the user they woke up and did great. Keep it brief and warm - about 1-2 sentences. Avoid wishing them a wonderful day or discussing the future."
                         }
                     }
                     await self.openai.ws.send(json.dumps(goodbye_response))

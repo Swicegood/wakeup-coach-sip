@@ -25,7 +25,7 @@
 
 5. **Sleep Detection**: Working silence detection and callback
    - Detects 10 seconds of silence
-   - Prompts "Are you sleeping?"
+   - Prompts a quick gentle check-in (can you hear me?)
    - Waits 10 seconds for response
    - Hangs up and calls back if no response
 
@@ -112,6 +112,6 @@ docker-compose down && docker-compose build wakeup-coach && docker-compose up wa
 5. App creates bridge + external media channel
 6. OpenAI session started, initial greeting sent
 7. Bidirectional conversation flows
-8. If 10s silence → "Are you sleeping?" → 10s wait → hang up + callback
+8. If 10s silence → "Quick check-in: can you hear me?" → 10s wait → hang up + callback
 9. If user says "goodbye" + doorbell activated → end permanently
 10. If user hangs up without goodbye → callback in 2 seconds

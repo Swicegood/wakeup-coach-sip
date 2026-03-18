@@ -347,7 +347,7 @@ class AudioBridgeRTP:
                     "role": "user",
                     "content": [{
                         "type": "input_text",
-                        "text": "Hello! This is your wake-up call. Please help me wake up by having a conversation with me."
+                        "text": "Hello! This is your wake-up call. I feel very sleepy and groggy right now. Please help me wake up gently and gradually with coaching for the present moment (stretch, breathe, and small check-ins). Keep it encouraging and do not talk about the coming day."
                     }]
                 }
             }
@@ -359,7 +359,7 @@ class AudioBridgeRTP:
                 "type": "response.create",
                 "response": {
                     "modalities": ["audio", "text"],
-                    "instructions": "You are a friendly wake-up coach. Have an engaging conversation to help the person wake up. Be cheerful and encouraging."
+                    "instructions": "You are a calm wake-up coach. Prioritize gentle present-moment grounding and gradual awakening: breathing, stretching, and easy check-ins. Avoid future-oriented talk (plans for the day, tomorrow, looking forward). Keep the tone encouraging and low-pressure."
                 }
             }
             await self.openai.ws.send(json.dumps(response_create))
