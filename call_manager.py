@@ -385,6 +385,57 @@ class CallManager:
                 self.logger.info(f"Starting conversation via external media channel")
                 await self._start_conversation(self.current_channel_id)
 
+    def _channel_is_our_rtp_media(self, channel_id: str, channel_name: str) -> bool:
+        """True if this ARI channel is our UnicastRTP external-media leg."""
+        if not channel_name.startswith("UnicastRTP/"):
+            return False
+        if not self.bridge or not self.bridge.media_channel_id:
+            return False
+        return channel_id == self.bridge.media_channel_id
+
+    def _channel_is_our_phone(self, channel_id: str, channel_name: str) -> bool:
+        """True if this is the PJSIP leg we are bridging (id may match current_channel_id or bridge)."""
+        if not channel_name.startswith("PJSIP/"):
+            return False
+        if channel_id == self.current_channel_id:
+            return True
+        if self.bridge and self.bridge.phone_channel_id and channel_id == self.bridge.phone_channel_id:
+            return True
+        return False
+
+    async def _tear_down_call_session(self, reason: str):
+        """
+        Full teardown: stop RTP bridge first (stops input_audio to OpenAI), then close OpenAI, then _cleanup.
+        Safe when hangup hits the media leg before/instead of the phone leg.
+        """
+        self.logger.info(f"Tearing down call session: {reason}")
+        self.call_active = False
+        self.state = CallState.CALL_ENDED
+        self.cleanup_complete.clear()
+
+        if self.bridge:
+            self.logger.info("Stopping audio bridge...")
+            try:
+                await self.bridge.stop()
+            except Exception as e:
+                self.logger.error(f"Error stopping audio bridge: {e}")
+            self.bridge = None
+
+        if self.openai and self.openai.ws:
+            self.logger.info("Closing OpenAI connection...")
+            try:
+                await self.openai.close()
+            except Exception as e:
+                self.logger.error(f"Error closing OpenAI: {e}")
+
+        current_task = asyncio.current_task()
+        if self.sleep_check_task and self.sleep_check_task != current_task:
+            self.sleep_check_task.cancel()
+        if self.sleep_prompt_task and self.sleep_prompt_task != current_task:
+            self.sleep_prompt_task.cancel()
+
+        await self._cleanup()
+
     async def _handle_stasis_end(self, event: dict):
         """Handle StasisEnd event when a channel leaves the Stasis application."""
         self.logger.info(f"StasisEnd handler called! Event: {event}")
@@ -394,34 +445,19 @@ class CallManager:
 
         self.logger.info(f"StasisEnd: channel={channel_id}, name={channel_name}, current_channel_id={self.current_channel_id}, call_active={self.call_active}, bridge={self.bridge is not None}")
 
-        # Handle PJSIP channel leaving Stasis - this means the call ended
-        # Check by channel_id match OR if it's a PJSIP channel and we still have a bridge (cleanup might have cleared current_channel_id)
-        if channel_name.startswith("PJSIP/") and (channel_id == self.current_channel_id or (self.bridge is not None and self.call_active)):
-            self.logger.info(f"PJSIP channel {channel_id} left Stasis - call ended (user hung up)")
-            self.call_active = False
-            self.state = CallState.CALL_ENDED
-            self.cleanup_complete.clear()  # Clear event so callback loop waits for cleanup
-            
-            # Stop RTP bridge FIRST: sets running=False and stops input_audio_buffer.append
-            # while ws may still be non-None during close(). OpenAI before bridge caused a hangup flood.
-            if self.bridge:
-                self.logger.info("Stopping audio bridge IMMEDIATELY...")
-                try:
-                    await self.bridge.stop()
-                    self.logger.info("Audio bridge stopped")
-                except Exception as e:
-                    self.logger.error(f"Error stopping audio bridge: {e}")
-                self.bridge = None
+        # External media often leaves Stasis around user hangup; must tear down or bridge keeps running.
+        if self._channel_is_our_rtp_media(channel_id, channel_name):
+            await self._tear_down_call_session("UnicastRTP left Stasis")
+            return
 
-            if self.openai and self.openai.ws:
-                self.logger.info("Closing OpenAI connection...")
-                try:
-                    await self.openai.close()
-                    self.logger.info("OpenAI connection closed")
-                except Exception as e:
-                    self.logger.error(f"Error closing OpenAI: {e}")
-            
-            await self._cleanup()
+        # PJSIP channel leaving Stasis — call ended
+        if channel_name.startswith("PJSIP/") and (
+            channel_id == self.current_channel_id
+            or (self.bridge is not None and self.call_active)
+            or self._channel_is_our_phone(channel_id, channel_name)
+        ):
+            self.logger.info(f"PJSIP channel {channel_id} left Stasis - call ended (user hung up)")
+            await self._tear_down_call_session("PJSIP left Stasis")
 
     async def _handle_channel_state_change(self, event: dict):
         """Handle channel state changes."""
@@ -747,6 +783,14 @@ class CallManager:
         channel_name = channel.get("name", "")
         
         self.logger.info(f"Hangup requested for channel {channel_id} ({channel_name})")
+
+        if not self.call_active and not self.bridge:
+            return
+
+        # Asterisk often emits hangup on UnicastRTP first; we used to ignore it and never stopped the bridge.
+        if self._channel_is_our_rtp_media(channel_id, channel_name):
+            await self._tear_down_call_session("ChannelHangupRequest on external media")
+            return
         
         # If it's a Local channel hangup during an active call, check if PJSIP channel is still in Stasis
         # This handles cases where user hangs up and we only get Local channel hangups
@@ -756,92 +800,18 @@ class CallManager:
                 channel_info = await self.ari.get_channel(self.current_channel_id)
                 if not channel_info or channel_info.get("state") != "Up":
                     self.logger.info(f"PJSIP channel {self.current_channel_id} no longer in Stasis - user hung up")
-                    # Trigger cleanup as if PJSIP channel hung up
-                    self.call_active = False
-                    self.state = CallState.CALL_ENDED
-                    self.cleanup_complete.clear()
-                    
-                    if self.bridge:
-                        self.logger.info("Stopping audio bridge IMMEDIATELY...")
-                        try:
-                            await self.bridge.stop()
-                        except Exception as e:
-                            self.logger.error(f"Error stopping audio bridge: {e}")
-                        self.bridge = None
-
-                    if self.openai and self.openai.ws:
-                        self.logger.info("Closing OpenAI connection...")
-                        try:
-                            await self.openai.close()
-                        except Exception as e:
-                            self.logger.error(f"Error closing OpenAI: {e}")
-                    
-                    await self._cleanup()
+                    await self._tear_down_call_session("Local hangup hint — PJSIP not Up")
                     return
             except Exception as e:
                 # Channel doesn't exist - user hung up
                 self.logger.info(f"PJSIP channel {self.current_channel_id} not found: {e} - user hung up")
-                self.call_active = False
-                self.state = CallState.CALL_ENDED
-                self.cleanup_complete.clear()
-                
-                # IMMEDIATELY close OpenAI and stop bridge
-                if self.openai and self.openai.ws:
-                    self.logger.info("Closing OpenAI connection IMMEDIATELY to stop audio...")
-                    try:
-                        await self.openai.close()
-                    except Exception as e:
-                        self.logger.error(f"Error closing OpenAI: {e}")
-                
-                if self.bridge:
-                    self.logger.info("Stopping audio bridge IMMEDIATELY...")
-                    try:
-                        await self.bridge.stop()
-                    except Exception as e:
-                        self.logger.error(f"Error stopping audio bridge: {e}")
-                    self.bridge = None
-                
-                await self._cleanup()
+                await self._tear_down_call_session("Local hangup hint — PJSIP missing")
                 return
         
-        # If it's the PJSIP channel (the actual phone call), end the call immediately
-        if channel_name.startswith("PJSIP/") and channel_id == self.current_channel_id:
+        # PJSIP leg (match current id or bridge phone id — they can diverge briefly)
+        if self._channel_is_our_phone(channel_id, channel_name):
             self.logger.info(f"PJSIP channel {channel_id} hangup requested - ending call immediately")
-            self.call_active = False
-            self.state = CallState.CALL_ENDED
-            self.cleanup_complete.clear()  # Clear event so callback loop waits for cleanup
-            
-            # IMMEDIATELY close OpenAI to stop it from sending audio
-            if self.openai and self.openai.ws:
-                self.logger.info("Closing OpenAI connection IMMEDIATELY to stop audio...")
-                try:
-                    await self.openai.close()
-                    self.logger.info("OpenAI connection closed")
-                except Exception as e:
-                    self.logger.error(f"Error closing OpenAI: {e}")
-            
-            # IMMEDIATELY stop audio bridge to stop sending packets
-            if self.bridge:
-                self.logger.info("Stopping audio bridge IMMEDIATELY to stop sending packets...")
-                try:
-                    await self.bridge.stop()
-                    self.logger.info("Audio bridge stopped")
-                except Exception as e:
-                    self.logger.error(f"Error stopping audio bridge: {e}")
-                # Clear bridge reference so cleanup doesn't try again
-                self.bridge = None
-            
-            # Cancel sleep detection tasks immediately to prevent them from detecting "silence"
-            current_task = asyncio.current_task()
-            if self.sleep_check_task and self.sleep_check_task != current_task:
-                self.logger.info("Cancelling sleep detection task immediately")
-                self.sleep_check_task.cancel()
-            if self.sleep_prompt_task and self.sleep_prompt_task != current_task:
-                self.logger.info("Cancelling sleep prompt task immediately")
-                self.sleep_prompt_task.cancel()
-            
-            # Do rest of cleanup (but OpenAI and bridge are already done)
-            await self._cleanup()
+            await self._tear_down_call_session("ChannelHangupRequest on phone channel")
 
     async def _handle_channel_destroyed(self, event: dict):
         """Handle channel destruction."""
@@ -858,48 +828,28 @@ class CallManager:
             self.logger.debug(f"Ignoring Local channel destruction: {channel_name}")
             return
 
-        # Handle PJSIP channel destruction - this means the call ended
-        # Check by ID, or if it's a PJSIP channel and we have an active call (bridge exists or call_active)
-        # This handles cases where call_active was already set to False by another handler
-        if (channel_id == self.current_channel_id or 
-            (channel_name.startswith("PJSIP/") and (self.call_active or self.bridge is not None))):
+        if self._channel_is_our_rtp_media(channel_id, channel_name):
+            self.logger.info("UnicastRTP (external media) channel destroyed — tearing down call")
+            await self._tear_down_call_session("external media ChannelDestroyed")
+            return
+
+        # PJSIP channel destruction — same condition as before, plus explicit phone leg match
+        if channel_id == self.current_channel_id or self._channel_is_our_phone(channel_id, channel_name) or (
+            channel_name.startswith("PJSIP/") and (self.call_active or self.bridge is not None)
+        ):
             self.logger.info(f"PJSIP channel destroyed - call ended (user hung up)")
-            self.call_active = False
-            self.state = CallState.CALL_ENDED
-            self.cleanup_complete.clear()  # Clear event so callback loop waits for cleanup
-            
-            # Log different causes for debugging
-            if cause == 16:  # Normal clearing
+            if cause == 16:
                 self.logger.info("Call ended normally (user hung up)")
-            elif cause == 21:  # User busy
+            elif cause == 21:
                 self.logger.warning("User was busy - call not answered")
-            elif cause == 27:  # Destination out of order
+            elif cause == 27:
                 self.logger.error("Destination out of order - check phone number")
-            elif cause == 34:  # Circuit/channel congestion
+            elif cause == 34:
                 self.logger.error("Circuit congestion - trunk may be unavailable")
             else:
                 self.logger.warning(f"Call ended with cause {cause}: {cause_txt}")
-            
-            # IMMEDIATELY close OpenAI to stop it from sending audio
-            if self.openai and self.openai.ws:
-                self.logger.info("Closing OpenAI connection IMMEDIATELY to stop audio...")
-                try:
-                    await self.openai.close()
-                    self.logger.info("OpenAI connection closed")
-                except Exception as e:
-                    self.logger.error(f"Error closing OpenAI: {e}")
-            
-            # IMMEDIATELY stop audio bridge
-            if self.bridge:
-                self.logger.info("Stopping audio bridge IMMEDIATELY...")
-                try:
-                    await self.bridge.stop()
-                    self.logger.info("Audio bridge stopped")
-                except Exception as e:
-                    self.logger.error(f"Error stopping audio bridge: {e}")
-                self.bridge = None
-            
-            await self._cleanup()
+
+            await self._tear_down_call_session("PJSIP ChannelDestroyed")
 
     async def _end_call(self):
         """End the current call."""
