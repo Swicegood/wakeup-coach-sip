@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Optional, Callable
 from datetime import datetime, timedelta, time as dt_time, timedelta
 from enum import Enum
@@ -394,16 +395,8 @@ class CallManager:
             self.state = CallState.CALL_ENDED
             self.cleanup_complete.clear()  # Clear event so callback loop waits for cleanup
             
-            # IMMEDIATELY close OpenAI to stop it from sending audio
-            if self.openai and self.openai.ws:
-                self.logger.info("Closing OpenAI connection IMMEDIATELY to stop audio...")
-                try:
-                    await self.openai.close()
-                    self.logger.info("OpenAI connection closed")
-                except Exception as e:
-                    self.logger.error(f"Error closing OpenAI: {e}")
-            
-            # IMMEDIATELY stop audio bridge
+            # Stop RTP bridge FIRST: sets running=False and stops input_audio_buffer.append
+            # while ws may still be non-None during close(). OpenAI before bridge caused a hangup flood.
             if self.bridge:
                 self.logger.info("Stopping audio bridge IMMEDIATELY...")
                 try:
@@ -412,6 +405,14 @@ class CallManager:
                 except Exception as e:
                     self.logger.error(f"Error stopping audio bridge: {e}")
                 self.bridge = None
+
+            if self.openai and self.openai.ws:
+                self.logger.info("Closing OpenAI connection...")
+                try:
+                    await self.openai.close()
+                    self.logger.info("OpenAI connection closed")
+                except Exception as e:
+                    self.logger.error(f"Error closing OpenAI: {e}")
             
             await self._cleanup()
 
@@ -473,42 +474,11 @@ class CallManager:
         """Continuously check if user has stopped responding (10 seconds of silence)."""
         self.logger.info(f"Sleep detection loop started. Interval: {self.sleep_check_interval}s")
         loop_count = 0
-        
-        # Wait for initial greeting to complete before starting silence detection
-        # The silence timer will be set when OpenAI finishes speaking (via _handle_ai_speech_finished)
-        # This gives time for: test tone (1s) + OpenAI greeting (~5-10s) + buffer
-        initial_grace_period = 20  # seconds - max wait for initial greeting
-        self.logger.info(f"Sleep detection: waiting for OpenAI to finish initial greeting (max {initial_grace_period}s)...")
-        
-        # Wait for OpenAI to finish speaking (last_user_response_time will be set by _handle_ai_speech_finished)
-        # OR timeout after grace period
-        grace_start = datetime.now()
-        while self.call_active and self.state != CallState.CALL_ENDED:
-            # Check call_active more frequently to respond to hangups faster
-            for _ in range(5):  # 5 * 0.2s = 1s total
-                if not self.call_active or self.state == CallState.CALL_ENDED:
-                    self.logger.info("Sleep detection loop: call ended during grace period, exiting")
-                    return
-                try:
-                    await asyncio.sleep(0.2)
-                except asyncio.CancelledError:
-                    self.logger.info("Sleep detection loop cancelled during grace period")
-                    raise
-            
-            elapsed = (datetime.now() - grace_start).total_seconds()
-            
-            # If OpenAI has finished speaking (last_user_response_time is set), we can start the silence timer
-            if self.last_user_response_time:
-                self.logger.info(f"OpenAI finished speaking - starting silence detection (timer set to {self.last_user_response_time})")
-                break
-            
-            # Grace period timeout - set timer anyway (fallback if OpenAI speech finished callback didn't fire)
-            if elapsed >= initial_grace_period:
-                self.logger.warning(f"Grace period complete ({initial_grace_period}s) but OpenAI speech finished callback didn't fire - starting silence detection anyway")
-                self.last_user_response_time = datetime.now()
-                break
-        
-        # Main silence detection loop
+        # Silence timer arms when AI finishes (_handle_ai_speech_finished). While assistant talks,
+        # last_user_response_time stays None — no separate "grace" phase (avoids odd hangup timing).
+        silence_fallback_deadline = time.monotonic() + 25.0
+        silence_fallback_used = False
+
         try:
             while self.call_active and self.state != CallState.CALL_ENDED:
                 # Check call_active more frequently (every 0.2s instead of 1s) to respond to hangups faster
@@ -523,6 +493,19 @@ class CallManager:
                         raise
                 
                 loop_count += 1
+
+                if (
+                    not silence_fallback_used
+                    and self.last_user_response_time is None
+                    and time.monotonic() >= silence_fallback_deadline
+                    and self.call_active
+                    and self.state == CallState.CALL_ACTIVE
+                ):
+                    self.logger.warning(
+                        "No AI finished callback after 25s — arming silence timer anyway (fallback)"
+                    )
+                    self.last_user_response_time = datetime.now()
+                    silence_fallback_used = True
                 
                 # Check for silence (only when in CALL_ACTIVE state)
                 if self.last_user_response_time and self.state == CallState.CALL_ACTIVE:
@@ -771,14 +754,6 @@ class CallManager:
                     self.state = CallState.CALL_ENDED
                     self.cleanup_complete.clear()
                     
-                    # IMMEDIATELY close OpenAI and stop bridge
-                    if self.openai and self.openai.ws:
-                        self.logger.info("Closing OpenAI connection IMMEDIATELY to stop audio...")
-                        try:
-                            await self.openai.close()
-                        except Exception as e:
-                            self.logger.error(f"Error closing OpenAI: {e}")
-                    
                     if self.bridge:
                         self.logger.info("Stopping audio bridge IMMEDIATELY...")
                         try:
@@ -786,6 +761,13 @@ class CallManager:
                         except Exception as e:
                             self.logger.error(f"Error stopping audio bridge: {e}")
                         self.bridge = None
+
+                    if self.openai and self.openai.ws:
+                        self.logger.info("Closing OpenAI connection...")
+                        try:
+                            await self.openai.close()
+                        except Exception as e:
+                            self.logger.error(f"Error closing OpenAI: {e}")
                     
                     await self._cleanup()
                     return
