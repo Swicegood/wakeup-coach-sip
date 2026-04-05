@@ -21,6 +21,11 @@ except ImportError:
 
 from ari_client import ARIClient
 from openai_client import OpenAIRealtimeClient
+from coach_prompts import (
+    GOODBYE_RESPONSE_INSTRUCTIONS,
+    SLEEP_CHECK_RESPONSE_INSTRUCTIONS,
+    SLEEP_CHECK_USER_PROMPT,
+)
 from audio_bridge_rtp import AudioBridgeRTP
 from config import Config
 from doorbell_webhook import DoorbellWebhook
@@ -559,7 +564,7 @@ class CallManager:
                 "item": {
                     "type": "message",
                     "role": "user",
-                    "content": [{"type": "input_text", "text": "Do a quick, gentle check-in. Ask: 'Can you hear me? Say yes if you are awake enough for one breath and one stretch.' Keep it very short."}]
+                    "content": [{"type": "input_text", "text": SLEEP_CHECK_USER_PROMPT}]
                 }
             }
             await self.openai.ws.send(json.dumps(prompt_message))
@@ -569,7 +574,7 @@ class CallManager:
                 "type": "response.create",
                 "response": {
                     "modalities": ["audio", "text"],
-                    "instructions": "Ask the quick gentle check-in question only. Do not ask additional questions."
+                    "instructions": SLEEP_CHECK_RESPONSE_INSTRUCTIONS,
                 }
             }
             await self.openai.ws.send(json.dumps(response_create))
@@ -629,6 +634,11 @@ class CallManager:
         
         # Real transcription - reset silence timer so a short pause (e.g. 3s) doesn't trigger sleep check
         self.logger.info(f"User said: {transcript[:100] if transcript else 'N/A'}")
+        if self.openai and self.openai.ws:
+            try:
+                await self.openai.update_coach_state_from_user_text(transcript)
+            except Exception as e:
+                self.logger.warning(f"Coach state update failed: {e}")
         if self.state == CallState.CALL_ACTIVE:
             self.last_user_response_time = datetime.now()
             self.logger.debug("User spoke - reset silence timer (13s countdown restarts)")
@@ -677,7 +687,7 @@ class CallManager:
                         "type": "response.create",
                         "response": {
                             "modalities": ["audio", "text"],
-                            "instructions": "Say an encouraging goodbye message. Focus on the present: tell the user they woke up and did great. Keep it brief and warm - about 1-2 sentences. Avoid wishing them a wonderful day or discussing the future."
+                            "instructions": GOODBYE_RESPONSE_INSTRUCTIONS,
                         }
                     }
                     await self.openai.ws.send(json.dumps(goodbye_response))

@@ -11,6 +11,7 @@ import websockets
 from websockets.client import WebSocketClientProtocol
 
 from config import OpenAIConfig
+from coach_prompts import build_session_instructions, infer_coach_user_state
 
 
 class OpenAIRealtimeClient:
@@ -55,6 +56,10 @@ class OpenAIRealtimeClient:
         self._last_audio_delta_time: Optional[float] = None
         self._speech_finished_task: Optional[asyncio.Task] = None
 
+        # Heuristic coaching state (see coach_prompts.infer_coach_user_state)
+        self._coach_user_state = "barely_awake"
+        self._coach_user_turn_count = 0
+
     async def connect(self):
         """Connect to OpenAI Realtime API WebSocket."""
         url = f"{self.REALTIME_API_URL}?model={self.config.model}"
@@ -98,20 +103,47 @@ class OpenAIRealtimeClient:
             self.logger.error(f"Failed to connect to OpenAI: {e}")
             raise
 
+    def _reset_coaching_state(self):
+        self._coach_user_state = "barely_awake"
+        self._coach_user_turn_count = 0
+
+    async def _push_session_instructions(self):
+        """Send session.update with full instructions (including user_state line)."""
+        if not self.ws:
+            return
+        msg = {
+            "type": "session.update",
+            "session": {
+                "instructions": build_session_instructions(
+                    self.wake_keyword, self._coach_user_state
+                )
+            },
+        }
+        await self.ws.send(json.dumps(msg))
+
+    async def update_coach_state_from_user_text(self, transcript: str):
+        """After a real user transcript, optionally bump user_state via session.update."""
+        if not self.ws or not transcript.strip():
+            return
+        self._coach_user_turn_count += 1
+        new_state = infer_coach_user_state(
+            transcript, self._coach_user_state, self._coach_user_turn_count
+        )
+        if new_state == self._coach_user_state:
+            return
+        self._coach_user_state = new_state
+        self.logger.info(f"Coach user_state -> {new_state}")
+        await self._push_session_instructions()
+
     async def _initialize_session(self):
         """Initialize the session with instructions."""
+        self._reset_coaching_state()
         session_config = {
             "type": "session.update",
             "session": {
                 "modalities": ["text", "audio"],
-                "instructions": (
-                    "You are a gentle wake-up coach. The user is often very sleepy, groggy, and not in the mood to think about the future.\n"
-                    "Do not discuss plans for the day, tomorrow, or anything future-oriented. Keep everything grounded in the present moment.\n"
-                    "Your goal is to help them gradually wake up right now with calm, encouraging coaching.\n"
-                    "Use a low-pressure tone and short, simple steps (one action at a time). Common steps include: stretch hands/neck, roll shoulders, wiggle toes, take 3 slow breaths, and notice sensations in the body.\n"
-                    "After each step, ask an easy check-in question (e.g., 'Can you feel your toes?' or 'Are you breathing slowly?').\n"
-                    "Never shame, never pressure, and never move on to complex topics. If the user sounds flat or upset, respond with empathy and guide the next small physical/breathing step.\n"
-                    "The call will end when the user says the wake word."
+                "instructions": build_session_instructions(
+                    self.wake_keyword, self._coach_user_state
                 ),
                 "voice": "alloy",
                 "input_audio_format": "pcm16",

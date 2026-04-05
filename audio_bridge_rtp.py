@@ -10,6 +10,7 @@ import numpy as np
 from scipy import signal
 
 from ari_client import ARIClient
+from coach_prompts import FIRST_RESPONSE_INSTRUCTIONS, FIRST_USER_SCENARIO
 from openai_client import OpenAIRealtimeClient
 from rtp_server import RTPServer
 
@@ -347,7 +348,7 @@ class AudioBridgeRTP:
                     "role": "user",
                     "content": [{
                         "type": "input_text",
-                        "text": "Hello! This is your wake-up call. I feel very sleepy and groggy right now. Please help me wake up gently and gradually with coaching for the present moment (stretch, breathe, and small check-ins). Keep it encouraging and do not talk about the coming day."
+                        "text": FIRST_USER_SCENARIO
                     }]
                 }
             }
@@ -359,7 +360,7 @@ class AudioBridgeRTP:
                 "type": "response.create",
                 "response": {
                     "modalities": ["audio", "text"],
-                    "instructions": "You are a calm wake-up coach. Prioritize gentle present-moment grounding and gradual awakening: breathing, stretching, and easy check-ins. Avoid future-oriented talk (plans for the day, tomorrow, looking forward). Keep the tone encouraging and low-pressure."
+                    "instructions": FIRST_RESPONSE_INSTRUCTIONS,
                 }
             }
             await self.openai.ws.send(json.dumps(response_create))
