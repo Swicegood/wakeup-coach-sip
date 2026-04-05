@@ -101,7 +101,8 @@ class CallManager:
         # Set up callbacks
         self.openai.on_user_speech = self._handle_user_speech  # Track user responses
         self.openai.on_wake_detected = self._handle_wake_detected
-        self.openai.on_ai_speech_finished = self._handle_ai_speech_finished  # Track when AI finishes speaking
+        self.openai.on_ai_speech_started = self._handle_ai_speech_started  # Pause silence timer while AI talks
+        self.openai.on_ai_speech_finished = self._handle_ai_speech_finished  # Start user-response window when AI ends
 
         async with self.ari:
             # Connect to ARI WebSocket
@@ -640,8 +641,10 @@ class CallManager:
             except Exception as e:
                 self.logger.warning(f"Coach state update failed: {e}")
         if self.state == CallState.CALL_ACTIVE:
-            self.last_user_response_time = datetime.now()
-            self.logger.debug("User spoke - reset silence timer (13s countdown restarts)")
+            # Do not anchor silence detection to user speech — that counts down during long AI replies.
+            # Pause until this turn's AI audio completes; timer starts in _handle_ai_speech_finished.
+            self.last_user_response_time = None
+            self.logger.debug("User spoke - silence detection paused until AI finishes speaking")
         
         # Check if we're waiting for response to sleep prompt
         if self.state == CallState.WAITING_FOR_USER_AFTER_SLEEP_PROMPT:
@@ -717,8 +720,15 @@ class CallManager:
                     }
                     await self.openai.ws.send(json.dumps(response_message))
 
+    async def _handle_ai_speech_started(self):
+        """Pause sleep/silence detection while the assistant is speaking."""
+        if not self.call_active:
+            return
+        self.last_user_response_time = None
+        self.logger.debug("AI started speaking - silence detection paused")
+
     async def _handle_ai_speech_finished(self):
-        """Handle when OpenAI finishes speaking - reset silence timer with buffer."""
+        """Handle when OpenAI finishes speaking - start the user-response silence window."""
         # Check if we were waiting for a goodbye response
         if self.waiting_for_goodbye_response:
             self.logger.info("Goodbye response complete - signaling to hang up")
