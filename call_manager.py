@@ -205,7 +205,10 @@ class CallManager:
                 await asyncio.wait_for(self.cleanup_complete.wait(), timeout=5.0)
                 self.logger.info("Cleanup complete, proceeding with callback")
             except asyncio.TimeoutError:
-                self.logger.warning("Cleanup timeout - proceeding anyway (may have timing issues)")
+                self.logger.warning(
+                    "Cleanup timeout - proceeding anyway; clearing stale channel id so callback can originate"
+                )
+                self.current_channel_id = None
                 # Set the event so we don't block next time
                 self.cleanup_complete.set()
             
@@ -293,9 +296,13 @@ class CallManager:
 
     async def _originate_call(self):
         """Originate a wake-up call with retry logic."""
-        # Prevent duplicate calls - if a call is already active or being originated, skip
-        if self.originating_call or self.call_active or self.current_channel_id:
-            self.logger.warning(f"Skipping duplicate call origination - originating: {self.originating_call}, active: {self.call_active}, channel: {self.current_channel_id}")
+        # Prevent duplicate calls only while a call is logically active or originate is in flight.
+        # Do not gate on current_channel_id: after hangup, cleanup can lag or skip once; a stale id
+        # would block all callbacks forever (originate would always "skip duplicate").
+        if self.originating_call or self.call_active:
+            self.logger.warning(
+                f"Skipping duplicate call origination - originating: {self.originating_call}, active: {self.call_active}"
+            )
             return
         
         self.originating_call = True
@@ -984,34 +991,35 @@ class CallManager:
         self.cleanup_complete.clear()  # Signal that cleanup is starting
         self.logger.info("Cleaning up resources")
 
-        # Cancel sleep detection tasks (but not if we're being called from one of them!)
-        # Get current task to avoid cancelling ourselves
-        current_task = asyncio.current_task()
-        
-        if self.sleep_check_task and self.sleep_check_task != current_task:
-            self.sleep_check_task.cancel()
-        if self.sleep_prompt_task and self.sleep_prompt_task != current_task:
-            self.sleep_prompt_task.cancel()
-
         try:
-            if self.bridge:
-                self.logger.info("Stopping audio bridge...")
-                await self.bridge.stop()
-                self.logger.info("Audio bridge stopped")
-        except Exception as e:
-            self.logger.error(f"Error stopping audio bridge: {e}", exc_info=True)
+            # Cancel sleep detection tasks (but not if we're being called from one of them!)
+            current_task = asyncio.current_task()
 
-        try:
-            if self.openai:
-                self.logger.info("Closing OpenAI connection...")
-                await self.openai.close()
-                self.logger.info("OpenAI connection closed")
-        except Exception as e:
-            self.logger.error(f"Error closing OpenAI connection: {e}", exc_info=True)
+            if self.sleep_check_task and self.sleep_check_task != current_task:
+                self.sleep_check_task.cancel()
+            if self.sleep_prompt_task and self.sleep_prompt_task != current_task:
+                self.sleep_prompt_task.cancel()
 
-        self.current_channel_id = None
-        self.bridge = None
-        self.last_user_response_time = None
-        self.cleaning_up = False
-        self.cleanup_complete.set()  # Signal that cleanup is complete
-        self.logger.info("Cleanup complete")
+            try:
+                if self.bridge:
+                    self.logger.info("Stopping audio bridge...")
+                    await self.bridge.stop()
+                    self.logger.info("Audio bridge stopped")
+            except Exception as e:
+                self.logger.error(f"Error stopping audio bridge: {e}", exc_info=True)
+
+            try:
+                if self.openai:
+                    self.logger.info("Closing OpenAI connection...")
+                    await self.openai.close()
+                    self.logger.info("OpenAI connection closed")
+            except Exception as e:
+                self.logger.error(f"Error closing OpenAI connection: {e}", exc_info=True)
+        finally:
+            # Always release originate/callback gating state even if close/stop misbehaves.
+            self.current_channel_id = None
+            self.bridge = None
+            self.last_user_response_time = None
+            self.cleaning_up = False
+            self.cleanup_complete.set()
+            self.logger.info("Cleanup complete")

@@ -327,11 +327,10 @@ class OpenAIRealtimeClient:
                 await self.on_audio_data(audio_bytes)
     
     async def _handle_speech_finished(self):
-        """Handle when OpenAI finishes speaking."""
-        # Only process if we were actually speaking (prevents duplicate calls)
-        if not self._is_speaking:
-            return
-        
+        """Handle when OpenAI finishes speaking (response.done)."""
+        # Always honor response.done: some responses never set _is_speaking (no response.created /
+        # no audio deltas). Skipping the callback left silence detection without a baseline and
+        # made teardown/callback races harder to reason about.
         self._is_speaking = False
 
         # Notify callback that AI finished speaking
