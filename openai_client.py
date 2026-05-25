@@ -59,12 +59,36 @@ class OpenAIRealtimeClient:
         self._coach_user_state = "barely_awake"
         self._coach_user_turn_count = 0
 
+    def _build_session_payload(self, instructions: str) -> dict:
+        """Build GA Realtime session config."""
+        return {
+            "type": "realtime",
+            "instructions": instructions,
+            "audio": {
+                "input": {
+                    "format": "pcm16",
+                    "transcription": {"model": "whisper-1"},
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.85,
+                        "prefix_padding_ms": 400,
+                        "silence_duration_ms": 1000,
+                        "create_response": True,
+                        "interrupt_response": True,
+                    },
+                },
+                "output": {
+                    "format": "pcm16",
+                    "voice": "alloy",
+                },
+            },
+        }
+
     async def connect(self):
         """Connect to OpenAI Realtime API WebSocket."""
         url = f"{self.REALTIME_API_URL}?model={self.config.model}"
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
-            "OpenAI-Beta": "realtime=v1"
         }
 
         self.logger.info(f"Connecting to OpenAI Realtime API: {self.config.model}")
@@ -89,8 +113,9 @@ class OpenAIRealtimeClient:
                 ping_interval=ping_interval,
                 ping_timeout=ping_timeout,
             )
-            self.logger.info("Connected to OpenAI Realtime API")
+            await self._wait_for_session_created()
             await self._initialize_session()
+            self.logger.info("Connected to OpenAI Realtime API")
         except Exception as e:
             self.logger.error(f"Failed to connect to OpenAI: {e}")
             raise
@@ -99,6 +124,18 @@ class OpenAIRealtimeClient:
         self._coach_user_state = "barely_awake"
         self._coach_user_turn_count = 0
 
+    async def _wait_for_session_created(self):
+        """Wait for the GA session.created event before sending session.update."""
+        message = await asyncio.wait_for(self.ws.recv(), timeout=10.0)
+        event = json.loads(message)
+        event_type = event.get("type")
+        if event_type == "error":
+            raise RuntimeError(f"OpenAI session error: {event.get('error')}")
+        if event_type != "session.created":
+            self.logger.warning(f"Expected session.created, got {event_type}")
+        else:
+            self.logger.info("Session created")
+
     async def _push_session_instructions(self):
         """Send session.update with full instructions (including user_state line)."""
         if not self.ws:
@@ -106,9 +143,10 @@ class OpenAIRealtimeClient:
         msg = {
             "type": "session.update",
             "session": {
+                "type": "realtime",
                 "instructions": build_session_instructions(
                     self.wake_keyword, self._coach_user_state
-                )
+                ),
             },
         }
         await self.ws.send(json.dumps(msg))
@@ -132,24 +170,9 @@ class OpenAIRealtimeClient:
         self._reset_coaching_state()
         session_config = {
             "type": "session.update",
-            "session": {
-                "modalities": ["text", "audio"],
-                "instructions": build_session_instructions(
-                    self.wake_keyword, self._coach_user_state
-                ),
-                "voice": "alloy",
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": "whisper-1"
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.85,  # High = requires clear speech, reduces false positives
-                    "prefix_padding_ms": 400,  # More padding before speech
-                    "silence_duration_ms": 1000  # 1 second silence before considering speech ended
-                }
-            }
+            "session": self._build_session_payload(
+                build_session_instructions(self.wake_keyword, self._coach_user_state)
+            ),
         }
 
         await self.ws.send(json.dumps(session_config))
@@ -204,7 +227,7 @@ class OpenAIRealtimeClient:
                     if event_type in ["response.created", "response.done", "conversation.item.input_audio_transcription.completed"]:
                         self.logger.debug(f"OpenAI connection healthy - received {event_type}")
 
-                    if event_type == "response.audio.delta":
+                    if event_type in ("response.output_audio.delta", "response.audio.delta"):
                         await self._handle_audio_delta(event)
                     elif event_type == "response.done":
                         # OpenAI finished speaking
@@ -225,11 +248,17 @@ class OpenAIRealtimeClient:
                         self.logger.info(f"Event keys: {list(event.keys())}")
                         self.logger.debug(f"Full event: {event}")
                         await self._handle_transcription(event)
-                    elif event_type == "response.audio_transcript.done":
+                    elif event_type in (
+                        "response.output_audio_transcript.done",
+                        "response.audio_transcript.done",
+                    ):
                         # This is the AI's transcription of its own output, not user input
                         # Skip it for user transcription, but log for debugging
                         self.logger.debug(f"AI response transcription (skipping): {event.get('transcript', '')[:100]}")
-                    elif event_type == "response.audio_transcript.delta":
+                    elif event_type in (
+                        "response.output_audio_transcript.delta",
+                        "response.audio_transcript.delta",
+                    ):
                         # Handle incremental transcription updates (optional, for real-time display)
                         pass  # We'll wait for the .done event for final transcript
                     elif event_type == "conversation.item.created":
@@ -264,8 +293,6 @@ class OpenAIRealtimeClient:
                         self.logger.info("User speech ended (VAD stop)")
                     elif event_type == "error":
                         self.logger.error(f"OpenAI error: {event.get('error')}")
-                    elif event_type == "session.created":
-                        self.logger.info("Session created")
                     elif event_type == "session.updated":
                         self.logger.info("Session updated")
 

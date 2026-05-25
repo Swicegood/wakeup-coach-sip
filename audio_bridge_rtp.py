@@ -359,7 +359,7 @@ class AudioBridgeRTP:
             response_create = {
                 "type": "response.create",
                 "response": {
-                    "modalities": ["audio", "text"],
+                    "output_modalities": ["audio"],
                     "instructions": FIRST_RESPONSE_INSTRUCTIONS,
                 }
             }

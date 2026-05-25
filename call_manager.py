@@ -600,7 +600,7 @@ class CallManager:
             response_create = {
                 "type": "response.create",
                 "response": {
-                    "modalities": ["audio", "text"],
+                    "output_modalities": ["audio"],
                     "instructions": SLEEP_CHECK_RESPONSE_INSTRUCTIONS,
                 }
             }
@@ -715,7 +715,7 @@ class CallManager:
                     goodbye_response = {
                         "type": "response.create",
                         "response": {
-                            "modalities": ["audio", "text"],
+                            "output_modalities": ["audio"],
                             "instructions": GOODBYE_RESPONSE_INSTRUCTIONS,
                         }
                     }
